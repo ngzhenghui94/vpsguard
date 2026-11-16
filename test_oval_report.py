@@ -81,6 +81,44 @@ def results_fixture(results=None):
     return root
 
 
+def vendor_fixture(platform, *, classes=("vulnerability",), platform_test=True, affected=True):
+    """Reduced shapes from Debian, RHEL/Alma/Oracle and SUSE official OVAL feeds."""
+    root = ET.Element(f"{{{D}}}oval_definitions")
+    definitions = add(root, D, "definitions")
+    rows = []
+    for number, kind in enumerate(classes, 1):
+        identifier = f"oval:vendor:def:{number}"
+        definition = add(definitions, D, "definition", id=identifier, version="7", **{"class": kind})
+        metadata = add(definition, D, "metadata")
+        add(metadata, D, "title", "Vendor advisory")
+        if affected:
+            add(add(metadata, D, "affected", family="unix"), D, "platform", platform)
+        add(metadata, D, "reference", source="CVE", ref_id="Mitre CVE-2025-1234",
+            ref_url="https://example.invalid/CVE-2025-1234")
+        advisory = add(metadata, D, "advisory")
+        add(advisory, D, "severity", "Moderate")
+        add(advisory, D, "cve", "CVE-2025-1234 at SUSE", href="https://example.invalid/cve")
+        add(advisory, D, "bugzilla", "Vendor bug", id="1234", href="https://example.invalid/bug")
+        if platform_test:
+            criteria = add(definition, D, "criteria", operator="AND")
+            add(criteria, D, "criterion", test_ref="oval:vendor:tst:1",
+                comment=platform + " is installed")
+        rows.append((identifier, "false"))
+    if platform_test:
+        add(add(root, D, "tests"), D + "#linux", "rpmverifyfile_test",
+            id="oval:vendor:tst:1", version="3", comment=platform + " is installed", check="at least one")
+    results = results_fixture(rows)
+    system = results.find(f"{{{R}}}results/{{{R}}}system")
+    for definition in system.find(f"{{{R}}}definitions"):
+        definition.set("version", "7")
+    info = system.find(f"{{{S}}}oval_system_characteristics/{{{S}}}system_info")
+    info.find(f"{{{S}}}os_name").text = platform
+    info.find(f"{{{S}}}os_version").text = "1"
+    if platform_test:
+        add(add(system, R, "tests"), R, "test", test_id="oval:vendor:tst:1", version="3", result="true")
+    return root, results
+
+
 class OvalReportTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -88,10 +126,10 @@ class OvalReportTests(unittest.TestCase):
         self.feed_path = Path(self.directory.name) / "feed.xml"
         self.results_path = Path(self.directory.name) / "results.xml"
 
-    def parse(self, results=None, feed=None):
+    def parse(self, results=None, feed=None, **kwargs):
         self.feed_path.write_bytes(ET.tostring(feed if feed is not None else feed_fixture(), encoding="utf-8"))
         self.results_path.write_bytes(ET.tostring(results if results is not None else results_fixture(), encoding="utf-8"))
-        return oval_report.parse_results(self.results_path, self.feed_path)
+        return oval_report.parse_results(self.results_path, self.feed_path, **kwargs)
 
     def test_real_shaped_false_results_are_complete_without_findings(self):
         report = self.parse()
@@ -124,6 +162,7 @@ class OvalReportTests(unittest.TestCase):
             "https://www.cve.org/CVERecord?id=CVE-2025-1234",
             "https://ubuntu.com/security/CVE-2025-1234",
         ])
+        self.assertEqual(finding["class"], "vulnerability")
 
     def test_mixed_results_expose_each_enum_and_incompleteness(self):
         extra = [(f"oval:com.ubuntu.noble:def:{index}", "vulnerability") for index in range(2, 7)]
@@ -237,6 +276,142 @@ class OvalReportTests(unittest.TestCase):
             {"source": "ref", "ref_id": "", "ref_url": "https://ubuntu.com/security/notices/USN-1234-1?x=1&y=2"},
             {"source": "bug", "ref_id": "", "ref_url": "https://bugs.launchpad.net/bugs/1234"},
         ])
+
+    def test_debian_mixed_vulnerabilities_and_missing_patches(self):
+        feed, results = vendor_fixture("Debian GNU/Linux 13", classes=("vulnerability", "patch"))
+        test = feed.find(f"{{{D}}}tests")[0]
+        test.tag = f"{{{D}#independent}}textfilecontent54_test"
+        definitions = results.find(f"{{{R}}}results/{{{R}}}system/{{{R}}}definitions")
+        for definition in definitions:
+            definition.set("result", "true")
+        report = self.parse(results, feed, finding_classes=("vulnerability", "patch"))
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual([finding["class"] for finding in report["findings"]], ["vulnerability", "patch"])
+        self.assertEqual(report["findings"][0]["cves"], ["CVE-2025-1234"])
+        self.assertEqual(self.parse(results, feed)["status"], "incomplete")
+
+    def test_vendor_missing_patch_streams_require_explicit_patch_class(self):
+        for platform in ("Red Hat Enterprise Linux 9", "AlmaLinux 9", "Oracle Linux 9"):
+            with self.subTest(platform=platform):
+                feed, results = vendor_fixture(platform, classes=("patch",), affected=not platform.startswith("Alma"))
+                row = results.find(f"{{{R}}}results/{{{R}}}system/{{{R}}}definitions")[0]
+                row.set("result", "true")
+                report = self.parse(results, feed, finding_classes=("patch",), host_platform=platform)
+                self.assertEqual(report["status"], "complete")
+                self.assertEqual(report["findings"][0]["class"], "patch")
+                self.assertEqual(report["findings"][0]["severity"], "Moderate")
+                self.assertEqual(self.parse(results, feed, host_platform=platform)["status"], "incomplete")
+
+    def test_missing_or_mismatched_platform_test_cannot_be_clean(self):
+        for value in ("false", "unknown", "error", "not evaluated", "not applicable", "missing", "version", "duplicate"):
+            feed, results = vendor_fixture("Debian GNU/Linux 13")
+            tests = results.find(f"{{{R}}}results/{{{R}}}system/{{{R}}}tests")
+            if value == "missing":
+                tests.remove(tests[0])
+            elif value == "duplicate":
+                tests.append(ET.fromstring(ET.tostring(tests[0])))
+            elif value == "version":
+                tests[0].set("version", "2")
+            else:
+                tests[0].set("result", value)
+            with self.subTest(value=value):
+                report = self.parse(results, feed, host_platform="Debian GNU/Linux 13")
+                self.assertEqual(report["status"], "incomplete")
+                self.assertTrue(any("host applicability" in item for item in report["limitations"]))
+
+    def test_platform_tests_are_bound_to_source_references_and_namespace(self):
+        for corruption in ("duplicate", "namespace", "unreferenced"):
+            feed, results = vendor_fixture("AlmaLinux 9", classes=("patch",), affected=False)
+            tests = feed.find(f"{{{D}}}tests")
+            if corruption == "duplicate":
+                tests.append(ET.fromstring(ET.tostring(tests[0])))
+            elif corruption == "namespace":
+                tests[0].tag = "{urn:wrong}rpmverifyfile_test"
+            else:
+                tests[0].set("id", "oval:vendor:tst:999")
+            with self.subTest(corruption=corruption):
+                self.assertEqual(self.parse(results, feed, finding_classes=("patch",),
+                                            host_platform="AlmaLinux 9")["status"], "incomplete")
+
+    def test_suse_platform_metadata_and_cve_labels(self):
+        feed, results = vendor_fixture("openSUSE Leap 16.0", platform_test=False)
+        row = results.find(f"{{{R}}}results/{{{R}}}system/{{{R}}}definitions")[0]
+        row.set("result", "true")
+        report = self.parse(results, feed)
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["findings"][0]["cves"], ["CVE-2025-1234"])
+        self.assertEqual(report["findings"][0]["references"][-1],
+                         {"source": "bugzilla", "ref_id": "1234", "ref_url": "https://example.invalid/bug"})
+        info = results.find(f"{{{R}}}results/{{{R}}}system/{{{S}}}oval_system_characteristics/{{{S}}}system_info")
+        info.find(f"{{{S}}}os_name").text = "Linux"
+        self.assertEqual(self.parse(results, feed)["status"], "incomplete")
+        self.assertEqual(self.parse(results, feed, host_platform="openSUSE Leap 16.0")["status"], "complete")
+        self.assertEqual(self.parse(results, feed, host_platform="openSUSE Leap 16.1")["status"], "incomplete")
+
+    def test_mismatched_results_host_is_not_replaced_by_scanner_assertion(self):
+        feed, results = vendor_fixture("Debian GNU/Linux 13", platform_test=False)
+        info = results.find(f"{{{R}}}results/{{{R}}}system/{{{S}}}oval_system_characteristics/{{{S}}}system_info")
+        for name in ("Ubuntu 24.04", "Debian GNU/Linux 12", "Debian GNU/Linux 130"):
+            info.find(f"{{{S}}}os_name").text = name
+            with self.subTest(name=name):
+                self.assertEqual(self.parse(results, feed, host_platform="Debian GNU/Linux 13")["status"], "incomplete")
+
+    def test_multiple_inventory_definitions_need_matching_true_evidence_not_all_true(self):
+        other = "oval:vendor:def:999"
+        feed = feed_fixture([(other, "inventory")])
+        rows = [(INVENTORY, "true"), (VULNERABILITY, "false"), (other, "false")]
+        self.assertEqual(self.parse(results_fixture(rows), feed)["status"], "complete")
+        rows = [(INVENTORY, "false"), (VULNERABILITY, "false"), (other, "true")]
+        self.assertEqual(self.parse(results_fixture(rows), feed)["status"], "incomplete")
+        self.assertEqual(self.parse(results_fixture(rows[:-1]), feed)["status"], "incomplete")
+
+    def test_unknown_or_unselected_classes_fail_closed(self):
+        for kind in ("compliance", "miscellaneous", "patch", "made-up"):
+            feed = feed_fixture()
+            feed.find(f"{{{D}}}definitions")[1].set("class", kind)
+            with self.subTest(kind=kind):
+                report = self.parse(feed=feed)
+                self.assertEqual(report["status"], "incomplete")
+                self.assertEqual(report["findings"], [])
+        for kinds in ((), ("inventory",), ("made-up",), ["patch"], "vulnerability"):
+            with self.subTest(kinds=kinds), self.assertRaisesRegex(ValueError, "finding classes"):
+                self.parse(finding_classes=kinds)
+
+    def test_linux_advisory_extension_namespace_preserves_evidence(self):
+        feed, results = vendor_fixture("Red Hat Enterprise Linux 9", classes=("patch",))
+        advisory = feed.find(f"{{{D}}}definitions/{{{D}}}definition/{{{D}}}metadata/{{{D}}}advisory")
+        for element in advisory.iter():
+            element.tag = f"{{{D}#linux}}" + element.tag.rsplit("}", 1)[-1]
+        results.find(f"{{{R}}}results/{{{R}}}system/{{{R}}}definitions")[0].set("result", "true")
+        report = self.parse(results, feed, finding_classes=("patch",))
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["findings"][0]["severity"], "Moderate")
+        self.assertEqual(report["findings"][0]["cves"], ["CVE-2025-1234"])
+
+    def test_source_platform_criterion_binds_test_without_test_comment(self):
+        feed, results = vendor_fixture("SUSE Linux Enterprise Server 15 SP7")
+        test = feed.find(f"{{{D}}}tests")[0]
+        test.set("comment", "sles-release package version is 15.7")
+        report = self.parse(results, feed, host_platform="SUSE Linux Enterprise Server 15 SP7")
+        self.assertEqual(report["status"], "complete")
+        row = results.find(f"{{{R}}}results/{{{R}}}system/{{{R}}}tests")[0]
+        row.set("result", "false")
+        self.assertEqual(self.parse(results, feed, host_platform="SUSE Linux Enterprise Server 15 SP7")["status"], "incomplete")
+        feed.find(f"{{{D}}}tests").remove(test)
+        self.assertEqual(self.parse(results, feed, host_platform="SUSE Linux Enterprise Server 15 SP7")["status"], "incomplete")
+
+    def test_unreferenced_inventories_need_matching_platform_metadata(self):
+        other = "oval:vendor:def:999"
+        feed = feed_fixture([(other, "inventory")])
+        definitions = feed.find(f"{{{D}}}definitions")
+        definitions[1].remove(definitions[1].find(f"{{{D}}}criteria"))
+        rows = [(INVENTORY, "true"), (VULNERABILITY, "false"), (other, "false")]
+        self.assertEqual(self.parse(results_fixture(rows), feed)["status"], "incomplete")
+        metadata = definitions[0].find(f"{{{D}}}metadata")
+        platform = add(add(metadata, D, "affected", family="unix"), D, "platform", "Ubuntu 24.04 LTS")
+        self.assertEqual(self.parse(results_fixture(rows), feed)["status"], "complete")
+        platform.text = "Debian GNU/Linux 13"
+        self.assertEqual(self.parse(results_fixture(rows), feed)["status"], "incomplete")
 
     def test_unsafe_xml_is_rejected_in_both_inputs_without_raw_xml_in_error(self):
         unsafe = [

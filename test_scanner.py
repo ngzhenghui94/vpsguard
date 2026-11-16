@@ -15,6 +15,11 @@ from unittest.mock import MagicMock, patch
 import urllib.request
 
 import scanner
+from profiles import select_profile
+
+
+PROFILE = select_profile({"ID": "ubuntu", "VERSION_ID": "24.04"})
+FEED_URL = PROFILE["feed_url"]
 
 
 NOW = datetime(2026, 11, 16, 12, tzinfo=timezone.utc)
@@ -29,7 +34,7 @@ def feed(timestamp=None):
       <generator><oval:timestamp>{timestamp}</oval:timestamp></generator>
       <definitions>
         <definition id="oval:com.ubuntu.noble:def:100" version="1" class="inventory">
-          <metadata><title>Ubuntu 24.04</title></metadata>
+          <metadata><title>Ubuntu 24.04</title><affected family="unix"><platform>Ubuntu 24.04 LTS</platform></affected></metadata>
         </definition>
         <definition id="oval:com.ubuntu.noble:def:200" version="1" class="vulnerability">
           <metadata><title>Fixture package CVE</title>
@@ -57,13 +62,14 @@ class ScannerTests(unittest.TestCase):
         self.uid = os.geteuid()
 
     def scan(self, *, xml=None, payload=None, result_xml=None, code=0, missing=None,
-             system="Linux", release=None, uid=0, executable="/usr/bin/oscap", error=None):
+             system="Linux", release=None, uid=0, executable="/usr/bin/oscap", error=None, final_url=None):
         xml = feed() if xml is None else xml
         payload = bz2.compress(xml) if payload is None else payload
         result_xml = results() if result_xml is None else result_xml
         response = io.BytesIO(payload)
         response.status = 200
-        response.geturl = lambda: scanner.FEED_URL
+        selected = select_profile(release or {"ID": "ubuntu", "VERSION_ID": "24.04"})
+        response.geturl = lambda: final_url or selected["feed_url"]
         opener = MagicMock()
         opener.open.return_value = response
 
@@ -124,7 +130,7 @@ class ScannerTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(Path(path).stat().st_mode), 0o600)
         self.assertEqual(len(report["artifacts"]), 6)
         self.assertEqual(popen.call_count, 2)
-        opener.open.assert_called_once_with(scanner.FEED_URL, timeout=scanner._SOCKET_TIMEOUT)
+        opener.open.assert_called_once_with(FEED_URL, timeout=scanner._SOCKET_TIMEOUT)
 
     def test_true_cve_is_a_finding_not_engine_error(self):
         report, _, _, _ = self.scan(result_xml=results("true"))
@@ -137,7 +143,7 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(report["counts"]["unknown"], 1)
 
     def test_prerequisites_fail_before_network_or_engine(self):
-        cases = [{"system": "Darwin"}, {"release": {"ID": "ubuntu", "VERSION_ID": "22.04"}},
+        cases = [{"system": "Darwin"}, {"release": {"ID": "ubuntu", "VERSION_ID": "18.04"}},
                  {"uid": 12345}, {"executable": None}]
         for index, case in enumerate(cases):
             with self.subTest(case=case):
@@ -256,10 +262,10 @@ class ScannerTests(unittest.TestCase):
             with self.subTest(limit=limit), patch.object(scanner, "_MAX_XML", limit), \
                     patch.object(scanner, "_now", return_value=NOW):
                 if limit == len(xml):
-                    self.assertEqual(scanner._validate_feed(path), NOW.isoformat())
+                    self.assertEqual(scanner._validate_feed(path, PROFILE), NOW.isoformat())
                 else:
                     with self.assertRaisesRegex(ValueError, "size limit"):
-                        scanner._validate_feed(path)
+                        scanner._validate_feed(path, PROFILE)
 
     def test_feed_encoding_duplicate_timestamps_and_depth_stop_before_eval(self):
         duplicate = feed().replace(b"</generator>",
@@ -288,16 +294,18 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(report["status"], "complete")
 
     def test_redirects_cannot_leave_verified_official_https(self):
-        handler = scanner._OfficialRedirect()
-        request = urllib.request.Request(scanner.FEED_URL)
+        handler = scanner._OfficialRedirect(PROFILE)
+        request = urllib.request.Request(FEED_URL)
         for url in ("http://security-metadata.canonical.com/feed", "https://example.com/feed",
                     "https://security-metadata.canonical.com:444/feed",
                     "https://user:secret@security-metadata.canonical.com/feed",
-                    "file:///etc/shadow", "https://security-metadata.canonical.com:invalid/feed"):
+                    "file:///etc/shadow", "https://security-metadata.canonical.com:invalid/feed",
+                    FEED_URL.replace("noble", "jammy"), FEED_URL + "?mirror=1",
+                    "https://www.debian.org/security/oval/oval-definitions-trixie.xml.bz2"):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 handler.redirect_request(request, None, 302, "Found", {}, url)
-        redirected = handler.redirect_request(request, None, 302, "Found", {}, scanner.FEED_URL)
-        self.assertEqual(redirected.full_url, scanner.FEED_URL)
+        redirected = handler.redirect_request(request, None, 302, "Found", {}, FEED_URL)
+        self.assertEqual(redirected.full_url, FEED_URL)
 
     def test_network_failure_is_incomplete_without_sensitive_details(self):
         with patch.object(scanner, "_download", side_effect=OSError("secret-token")):
@@ -343,6 +351,95 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(target.read_text(), "secret-token")
         self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
         self.assertNotIn("secret-token", json.dumps(report))
+
+    def test_release_profile_provenance_and_class_selection(self):
+        releases = [
+            ("ubuntu", "26.04"), ("debian", "13"), ("rhel", "9.6"),
+            ("almalinux", "9.5"), ("ol", "10"), ("rocky", "8.10"),
+            ("opensuse-leap", "16.0"), ("sles", "15.7"),
+        ]
+        for index, (distro, version) in enumerate(releases):
+            with self.subTest(distro=distro):
+                self.output = self.parent / f"profile-{index}"
+                release = {"ID": distro, "VERSION_ID": version}
+                profile = select_profile(release)
+                xml = feed().replace(b"Ubuntu 24.04 LTS", profile["platform"].encode())
+                finding_class = profile["finding_classes"][0]
+                xml = xml.replace(b'class="vulnerability"', f'class="{finding_class}"'.encode())
+                report, _, opener, _ = self.scan(release=release, xml=xml, result_xml=results("true"))
+                self.assertEqual(report["status"], "complete")
+                self.assertEqual(report["platform"], profile)
+                self.assertEqual(report["provenance"]["feed"]["finding_classes"], profile["finding_classes"])
+                self.assertEqual(len(report["findings"]), 1)
+                self.assertEqual(report["findings"][0]["class"], finding_class)
+                self.assertEqual(report["counts"]["true"], 2)
+                opener.open.assert_called_once_with(profile["feed_url"], timeout=scanner._SOCKET_TIMEOUT)
+
+    def test_unavailable_platforms_never_download_or_evaluate(self):
+        cases = [("rhel", "10"), ("rocky", "10"), ("amzn", "2023"), ("fedora", "45"),
+                 ("centos", "9"), ("debian", "10"), ("ubuntu;curl", "24.04")]
+        for index, (distro, version) in enumerate(cases):
+            with self.subTest(distro=distro):
+                self.output = self.parent / f"unavailable-{index}"
+                report, popen, opener, _ = self.scan(
+                    release={"ID": distro, "VERSION_ID": version, "ID_LIKE": "rhel ubuntu"})
+                self.assertEqual(report["status"], "incomplete")
+                self.assertIsNone(report["provenance"]["feed"]["url"])
+                self.assertTrue(report["platform"]["scan_unavailable"])
+                popen.assert_not_called()
+                opener.open.assert_not_called()
+
+    def test_version_or_vendor_mismatched_feed_stops_before_eval(self):
+        for index, platform_name in enumerate(("Ubuntu 22.04 LTS", "Debian GNU/Linux 13", "Ubuntu 24.040 LTS")):
+            with self.subTest(platform=platform_name):
+                self.output = self.parent / f"mismatch-{index}"
+                report, popen, _, _ = self.scan(
+                    xml=feed().replace(b"Ubuntu 24.04 LTS", platform_name.encode()))
+                self.assertEqual(report["status"], "incomplete")
+                self.assertEqual(popen.call_count, 1)
+                self.assertIn("platform identity", " ".join(report["limitations"]))
+
+    def test_final_response_cannot_switch_official_stream(self):
+        report, popen, _, _ = self.scan(final_url=FEED_URL.replace("noble", "jammy"))
+        self.assertEqual(report["status"], "incomplete")
+        self.assertEqual(popen.call_count, 1)
+
+    def test_stale_rocky_feed_explains_missing_current_vendor_coverage(self):
+        xml = feed("2025-03-31T18:50:00Z").replace(b"Ubuntu 24.04 LTS", b"Rocky Linux 9")
+        report, popen, _, _ = self.scan(release={"ID": "rocky", "VERSION_ID": "9"}, xml=xml)
+        self.assertEqual(report["status"], "incomplete")
+        self.assertEqual(popen.call_count, 1)
+        self.assertIn("Rocky Linux 9 official OVAL patch feed is stale", " ".join(report["limitations"]))
+
+    def test_distro_specific_install_prerequisite(self):
+        report, popen, opener, _ = self.scan(
+            release={"ID": "opensuse-leap", "VERSION_ID": "16.0"}, executable=None)
+        self.assertIn("openscap-utils", " ".join(report["limitations"]))
+        popen.assert_not_called()
+        opener.open.assert_not_called()
+
+    def test_debian_eleven_does_not_suggest_nonexistent_native_package(self):
+        report, popen, opener, _ = self.scan(
+            release={"ID": "debian", "VERSION_ID": "11"}, executable=None)
+        self.assertIn("no scanner package", " ".join(report["limitations"]))
+        popen.assert_not_called()
+        opener.open.assert_not_called()
+
+    def test_forged_profile_url_is_rejected_before_network(self):
+        profile = dict(PROFILE, feed_url="https://attacker.invalid/feed.xml.bz2")
+        with patch.object(scanner.urllib.request, "build_opener") as opener:
+            with self.assertRaisesRegex(ValueError, "allowlisted"):
+                scanner._download(-1, profile)
+        opener.assert_not_called()
+
+    def test_feed_test_identity_without_affected_metadata(self):
+        xml = feed().replace(b"<platform>Ubuntu 24.04 LTS</platform>", b"")
+        xml = xml.replace(b"</oval_definitions>", b'<tests><test comment="AlmaLinux 9 is installed"/></tests></oval_definitions>')
+        path = MagicMock()
+        path.open.return_value = io.BytesIO(xml)
+        profile = select_profile({"ID": "almalinux", "VERSION_ID": "9"})
+        with patch.object(scanner, "_now", return_value=NOW):
+            self.assertEqual(scanner._validate_feed(path, profile), NOW.isoformat())
 
     def test_cli_exit_codes_are_driven_by_completeness_and_findings(self):
         for status, findings, code in (("complete", [], 0), ("complete", [{}], 2),

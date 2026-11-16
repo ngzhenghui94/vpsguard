@@ -1,11 +1,14 @@
-"""Read-only Ubuntu 24.04 observations; successful collection is not a security pass."""
+"""Read-only Linux observations; successful collection is not a security pass."""
 
 import json
 import os
 from pathlib import Path
 import platform
+import shutil
 import subprocess
 import time
+
+from profiles import select_profile
 
 
 _TIMEOUT = 15
@@ -102,18 +105,76 @@ def _listeners():
 
 
 def _firewall():
-    text, error = _run(["ufw", "status", "verbose"])
-    if error:
-        return _check("unknown", note=error + " Non-UFW rules were not inspected.")
-    lines = [line.split("#", 1)[0].rstrip() for line in text.splitlines()]
-    active = "Status: active" in lines
-    inactive = "Status: inactive" in lines
-    if active == inactive:
-        return _check("unknown", note="UFW returned an unrecognized or conflicting status.")
-    status = "ok" if active else "warning"
-    return _check(status, {"backend": "ufw", "active": active, "rules": lines},
-                  "UFW view only: other nftables/iptables rules, cloud firewalls and Docker "
-                  "forwarding are not established by this output.")
+    backends = {}
+    incomplete = False
+    warning = False
+    for command in ("ufw", "firewall-cmd", "nft"):
+        if not shutil.which(command, path=_ENV["PATH"]):
+            continue
+        backend = {"ufw": "ufw", "firewall-cmd": "firewalld", "nft": "nftables"}[command]
+        args = {"ufw": ["ufw", "status", "verbose"],
+                "firewall-cmd": ["firewall-cmd", "--state"],
+                "nft": ["nft", "--json", "list", "ruleset"]}[command]
+        text, error = _run(args)
+        if error:
+            backends[backend] = _check("unknown", note=error)
+            incomplete = True
+            continue
+        if command == "ufw":
+            lines = [line.split("#", 1)[0].rstrip() for line in text.splitlines()]
+            active = "Status: active" in lines
+            inactive = "Status: inactive" in lines
+            if active == inactive:
+                backends[backend] = _check("unknown", note="Unrecognized or conflicting UFW status.")
+                incomplete = True
+                continue
+            backends[backend] = _check("ok" if active else "warning",
+                                       {"active": active, "rules": lines})
+            warning |= inactive
+        elif command == "firewall-cmd":
+            if text.strip() != "running":
+                backends[backend] = _check("unknown", note="firewalld is not confirmed running.")
+                incomplete = True
+                continue
+            zones, error = _run(["firewall-cmd", "--get-active-zones"])
+            rules, rules_error = _run(["firewall-cmd", "--list-all-zones"])
+            backends[backend] = _check(
+                "unknown" if error or rules_error or not rules.strip() else "ok",
+                {"active": True, "active_zones": zones.splitlines() if zones is not None else [],
+                 "zones": rules.splitlines() if rules is not None else []},
+                error or rules_error)
+            incomplete |= backends[backend]["status"] == "unknown"
+        else:
+            try:
+                entries = json.loads(text)["nftables"]
+                if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+                    raise ValueError("Invalid ruleset")
+                chains = []
+                rule_count = 0
+                for entry in entries:
+                    if "chain" in entry:
+                        chain = entry["chain"]
+                        if not isinstance(chain, dict):
+                            raise ValueError("Invalid chain")
+                        chains.append({key: chain[key] for key in
+                                       ("family", "table", "name", "type", "hook", "prio", "policy")
+                                       if key in chain})
+                    if "rule" in entry:
+                        if not isinstance(entry["rule"], dict):
+                            raise ValueError("Invalid rule")
+                        rule_count += 1
+                backends[backend] = _check("ok" if chains else "warning",
+                                           {"chains": chains, "rule_count": rule_count})
+                warning |= not chains
+            except (ValueError, KeyError, TypeError, RecursionError):
+                backends[backend] = _check("unknown", note="Unrecognized nftables JSON ruleset.")
+                incomplete = True
+    return _check("warning" if warning and not incomplete else "unknown",
+                  {"backends": backends},
+                  "Installed UFW, firewalld and nftables views only; missing tools are not evidence "
+                  "of an absent firewall. Collection does not establish effective filtering: "
+                  "rule ordering, interfaces, legacy iptables, cloud firewalls and Docker forwarding "
+                  "need review. Backend errors remain unknown; no firewall changes were made.")
 
 
 def _cache_age():
@@ -127,10 +188,15 @@ def _cache_age():
     return round(time.time() - min(timestamps))
 
 
-def _updates():
+def _updates(profile):
+    if profile["family"] != "debian":
+        return _rpm_updates(profile["family"])
     age = _cache_age()
-    data = {"cache_age_seconds": age, "cache_age_basis": "oldest cached repository Release mtime",
-            "security_updates": [], "pending_candidate_count": None}
+    ubuntu = profile["id"] == "ubuntu"
+    data = {"backend": "apt", "scope": "cached APT upgrade candidates",
+            "cache_age_seconds": age, "cache_age_basis": "oldest cached repository Release mtime",
+            "security_updates": [] if ubuntu else None, "pending_candidates": [],
+            "pending_candidate_count": None}
     text, error = _run(["apt", "list", "--upgradable", "-o", "APT::Color=0"])
     if error:
         return _check("unknown", data, error)
@@ -145,9 +211,10 @@ def _updates():
             malformed = True
             continue
         pending += 1
-        if any(suite.endswith("-security") for suite in suites.split(",")):
-            data["security_updates"].append({"package": package, "version": fields[1],
-                                             "architecture": fields[2]})
+        candidate = {"package": package, "version": fields[1], "architecture": fields[2]}
+        data["pending_candidates"].append(candidate)
+        if ubuntu and any(suite.endswith("-security") for suite in suites.split(",")):
+            data["security_updates"].append(candidate)
     data["pending_candidate_count"] = pending
     data["cache_stale_or_unknown"] = age is None or age > 86400
     # Candidate suites are not a complete security classification (e.g. superseded fixes).
@@ -155,12 +222,67 @@ def _updates():
     if malformed:
         status = "unknown"
     return _check(status, data,
-                  "No repository refresh performed. Counts use cached candidate suites only and "
-                  "may miss superseded security fixes or held packages; zero is not proof that "
-                  "the host is patched. Cache age is a file timestamp, not refresh verification.")
+                  "No repository refresh performed. Counts use cached candidates only; Ubuntu "
+                  "-security suites are a partial hint, not used to classify Debian candidates. "
+                  "Security provenance, superseded fixes and held packages may be missing; zero is not proof "
+                  "that the host is patched. Cache age is a file timestamp, not refresh verification.")
 
 
-def _accounts():
+def _rpm_updates(family):
+    candidates = ("zypper",) if family == "suse" else ("dnf", "dnf5", "yum")
+    backend = next((name for name in candidates if shutil.which(name, path=_ENV["PATH"])), None)
+    data = {"backend": backend, "scope": "cached applicable security patches" if family == "suse"
+            else "cached security update advisories", "security_updates": [],
+            "cache_age_seconds": None, "cache_stale_or_unknown": True,
+            "pending_candidate_count": None}
+    note = ("No repository refresh or installation performed. Cached advisory metadata may be "
+            "missing, stale or incomplete; repositories without security advisories, excluded "
+            "packages and unsupported output are not covered. Zero is not proof that the host is patched.")
+    if backend is None:
+        return _check("unknown", data, f"No {'/'.join(candidates)} command is installed. " + note)
+    if family == "suse":
+        args = ["zypper", "--non-interactive", "--no-refresh", "list-patches", "--category", "security"]
+    elif backend == "yum":
+        args = ["yum", "--cacheonly", "--quiet", "--color=never", "updateinfo", "list", "updates", "security"]
+    else:
+        args = [backend, "--cacheonly", "--quiet", "--color=never", "updateinfo", "list", "--updates", "--security"]
+    text, error = _run(args)
+    if error:
+        return _check("unknown", data, error + " " + note)
+    malformed = False
+    columns = None
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if family == "suse":
+            if "|" not in line:
+                continue
+            fields = [field.strip() for field in line.split("|")]
+            if {"Name", "Category", "Status"} <= set(fields):
+                columns = {name: fields.index(name) for name in ("Name", "Category", "Status")}
+                continue
+            if columns is None or len(fields) <= max(columns.values()):
+                malformed = True
+                continue
+            if fields[columns["Category"]] == "security":
+                data["security_updates"].append({"advisory": fields[columns["Name"]],
+                                                "status": fields[columns["Status"]]})
+            else:
+                malformed = True
+        else:
+            fields = line.split()
+            if fields[0] in {"Name", "Advisory"}:
+                continue
+            if len(fields) == 3 and (fields[1].lower().endswith("/sec.") or fields[1].lower() == "security"):
+                data["security_updates"].append({"advisory": fields[0], "package": fields[2]})
+            elif len(fields) >= 5 and fields[1].lower() == "security":
+                data["security_updates"].append({"advisory": fields[0], "package": fields[3]})
+            else:
+                malformed = True
+    return _check("warning" if data["security_updates"] and not malformed else "unknown", data, note)
+
+
+def _accounts(family="debian"):
     passwd, error = _run(["getent", "passwd"])
     if error:
         return _check("unknown", note=error)
@@ -168,6 +290,7 @@ def _accounts():
     if error:
         return _check("unknown", note=error)
     privileged_groups = {}
+    group_names = {"sudo", "admin", "wheel"} if family in {"rhel", "suse"} else {"sudo", "admin"}
     malformed = not groups.strip()
     for line in groups.splitlines():
         fields = line.split(":")
@@ -175,7 +298,7 @@ def _accounts():
         if gid is None:
             malformed = True
             continue
-        if fields[0] in {"sudo", "admin"}:
+        if fields[0] in group_names:
             privileged_groups[fields[0]] = (gid, set(filter(None, fields[3].split(","))))
     accounts = []
     seen = set()
@@ -195,8 +318,10 @@ def _accounts():
     unresolved = sorted({member for _, members in privileged_groups.values()
                          for member in members if member not in seen})
     return _check("unknown" if malformed or not seen or unresolved else "ok",
-                  {"accounts": accounts, "unresolved_group_members": unresolved},
-                  "UID 0 and sudo/admin groups only; custom sudoers, polkit, capabilities and "
+                  {"accounts": accounts, "unresolved_group_members": unresolved,
+                   "privileged_groups_checked": sorted(group_names)},
+                  "UID 0 and " + "/".join(sorted(group_names)) + " groups only; group membership "
+                  "does not prove sudo authorization. Custom sudoers, polkit, capabilities and "
                   "non-enumerable directory users can grant additional privileges.")
 
 
@@ -227,7 +352,7 @@ def _docker():
 
 
 def run_audit():
-    """Return JSON-safe observations without changing files, packages, services or firewall rules.
+    """Return JSON-safe observations without changing configuration, packages, services or firewall rules.
 
     ``checks`` maps names to ``status`` (ok/warning/unknown), ``data`` and ``note``.
     ``ok`` means the scoped observation succeeded without a known warning, not that
@@ -235,15 +360,17 @@ def run_audit():
     Unsupported hosts return empty checks and never invoke host commands.
     """
     release = _os_release()
-    supported = platform.system() == "Linux" and release.get("ID") == "ubuntu" and release.get("VERSION_ID") == "24.04"
-    report = {"supported": supported, "platform": release, "checks": {}, "findings": []}
+    profile = select_profile(release)
+    supported = platform.system() == "Linux" and profile["family"] in {"debian", "rhel", "suse"}
+    report = {"supported": supported, "platform": release, "profile": profile, "checks": {}, "findings": []}
     if not supported:
         report["findings"].append({"check": "platform", "severity": "unknown",
-                                   "message": "Unsupported host: requires Ubuntu 24.04 Linux; no commands were run."})
+                                   "message": "Unsupported host ID/version or non-Linux platform; no commands were run."})
         return report
     checks = report["checks"]
     for name, collect in (("ssh", _ssh), ("listeners", _listeners), ("firewall", _firewall),
-                          ("security_updates", _updates), ("privileged_accounts", _accounts),
+                          ("security_updates", lambda: _updates(profile)),
+                          ("privileged_accounts", lambda: _accounts(profile["family"])),
                           ("docker", _docker)):
         try:
             checks[name] = collect()

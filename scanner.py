@@ -1,4 +1,4 @@
-"""Local Ubuntu CVE evaluation using Canonical OVAL and the installed OpenSCAP."""
+"""Local package security evaluation using vendor OVAL and installed OpenSCAP."""
 
 import argparse
 import bz2
@@ -18,14 +18,13 @@ import stat
 import subprocess
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from xml.parsers import expat
 
 from oval_report import MAX_XML_BYTES, parse_results
+from profiles import select_profile
 
 
-FEED_URL = "https://security-metadata.canonical.com/oval/com.ubuntu.noble.cve.oval.xml.bz2"
 _MAX_COMPRESSED = 64 * 1024 * 1024
 _MAX_XML = MAX_XML_BYTES
 _DOWNLOAD_TIMEOUT = 120
@@ -34,7 +33,7 @@ _SCAN_TIMEOUT = 900
 _FEED_MAX_AGE = timedelta(days=7)
 _ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
 _LIMITATIONS = [
-    "Local Ubuntu 24.04 package CVEs covered by Canonical's CVE OVAL only; not a Tenable equivalent.",
+    "Only the selected vendor OVAL stream is evaluated; this is not a Tenable equivalent.",
     "No remote targets, exploit attempts, application dependency audit, or automatic remediation.",
     "A complete scan with no findings does not prove the host is secure; feed coverage and probe visibility apply.",
     "Raw results and HTML contain local system inventory; keep the private output directory confidential.",
@@ -52,22 +51,24 @@ def _now():
     return datetime.now(timezone.utc)
 
 
-def _allowed_url(url):
-    try:
-        parsed = urllib.parse.urlsplit(url)
-        return (parsed.scheme == "https" and parsed.hostname == "security-metadata.canonical.com"
-                and parsed.port in (None, 443) and parsed.username is None and parsed.password is None)
-    except ValueError:
-        return False
+def _allowed_url(url, profile):
+    # Pin both host and release-specific path; even another official feed is wrong.
+    selected = select_profile({"ID": profile["id"], "VERSION_ID": profile["version"]})
+    return (selected["feed_url"] is not None and url == selected["feed_url"]
+            and profile["feed_url"] == selected["feed_url"])
 
 
 class _OfficialRedirect(urllib.request.HTTPRedirectHandler):
     max_redirections = 3
     max_repeats = 1
 
+    def __init__(self, profile):
+        super().__init__()
+        self.profile = profile
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if not _allowed_url(newurl):
-            raise _ScanError("Feed redirect left the official HTTPS host.")
+        if not _allowed_url(newurl, self.profile):
+            raise _ScanError("Feed redirect left the selected official HTTPS stream.")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -96,16 +97,18 @@ def _new_directory(output_dir):
         os.close(parent_fd)
 
 
-def _download(directory_fd):
+def _download(directory_fd, profile):
+    if not _allowed_url(profile["feed_url"], profile):
+        raise _ScanError("No allowlisted official HTTPS stream exists for this profile.")
     opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({}), _OfficialRedirect(),
+        urllib.request.ProxyHandler({}), _OfficialRedirect(profile),
         urllib.request.HTTPSHandler(context=ssl.create_default_context()))
     deadline = time.monotonic() + _DOWNLOAD_TIMEOUT
     digest = hashlib.sha256()
     size = 0
-    with opener.open(FEED_URL, timeout=_SOCKET_TIMEOUT) as response, \
+    with opener.open(profile["feed_url"], timeout=_SOCKET_TIMEOUT) as response, \
             _private_file(directory_fd, "feed.xml.bz2") as output:
-        if response.status != 200 or not _allowed_url(response.geturl()):
+        if response.status != 200 or not _allowed_url(response.geturl(), profile):
             raise _ScanError("Official feed download returned an invalid response.")
         while True:
             if time.monotonic() > deadline:
@@ -123,7 +126,7 @@ def _download(directory_fd):
         final_url = response.geturl()
     if not size:
         raise _ScanError("Official feed download was empty.")
-    return {"url": FEED_URL, "final_url": final_url, "downloaded_at": _now().isoformat(),
+    return {"url": profile["feed_url"], "final_url": final_url, "downloaded_at": _now().isoformat(),
             "compressed_sha256": digest.hexdigest(), "compressed_bytes": size}
 
 
@@ -153,12 +156,16 @@ def _unpack(directory_fd, root):
     return {"sha256": digest.hexdigest(), "bytes": size}
 
 
-def _validate_feed(path):
+def _validate_feed(path, profile):
     parser = expat.ParserCreate(namespace_separator="}")
     stack = []
     timestamp = None
     text = []
     timestamp_path = [_OVAL + "oval_definitions", _OVAL + "generator", _COMMON + "timestamp"]
+    platform_path = [_OVAL + part for part in
+                     ("oval_definitions", "definitions", "definition", "metadata", "affected", "platform")]
+    platform_text = []
+    identity_found = False
 
     def reject(*args):
         raise _ScanError("Feed XML DTDs and entities are prohibited.")
@@ -168,6 +175,7 @@ def _validate_feed(path):
             raise _ScanError("Feed XML must be UTF-8.")
 
     def start(name, attrs):
+        nonlocal identity_found
         if not stack and name != _OVAL + "oval_definitions":
             raise _ScanError("Feed is not an OVAL definitions document.")
         if len(stack) >= 256:
@@ -175,19 +183,29 @@ def _validate_feed(path):
         stack.append(name)
         if stack == timestamp_path:
             text.clear()
+        if stack == platform_path:
+            platform_text.clear()
+        if len(stack) == 3 and stack[1] == _OVAL + "tests":
+            identity_found |= attrs.get("comment") == profile["platform"] + " is installed"
 
     def characters(value):
         if stack == timestamp_path:
             if sum(map(len, text)) + len(value) > 100:
                 raise _ScanError("Feed generator timestamp is invalid.")
             text.append(value)
+        if stack == platform_path:
+            if sum(map(len, platform_text)) + len(value) > 1024:
+                raise _ScanError("Feed platform metadata exceeds the size limit.")
+            platform_text.append(value)
 
     def end(name):
-        nonlocal timestamp
+        nonlocal timestamp, identity_found
         if stack == timestamp_path:
             if timestamp is not None:
                 raise _ScanError("Feed must contain exactly one generator timestamp.")
             timestamp = "".join(text).strip()
+        if stack == platform_path:
+            identity_found |= "".join(platform_text).strip() == profile["platform"]
         stack.pop()
 
     parser.StartDoctypeDeclHandler = reject
@@ -221,14 +239,17 @@ def _validate_feed(path):
         generated = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
     except ValueError:
         raise _ScanError("Feed generator timestamp is invalid.") from None
-    # Canonical's timezone-less OVAL generator timestamps are interpreted as UTC.
+    # Vendor timezone-less OVAL generator timestamps are interpreted as UTC.
     if generated.tzinfo is None:
         generated = generated.replace(tzinfo=timezone.utc)
     age = _now() - generated
     if age < -timedelta(minutes=5):
         raise _ScanError("Feed generator timestamp is in the future; check the host clock.")
     if age > _FEED_MAX_AGE:
-        raise _ScanError("Official CVE feed is stale (older than seven days).")
+        raise _ScanError(f"{profile['label']} official {profile['feed_kind']} feed is stale "
+                         "(generator timestamp older than seven days); current coverage is unavailable.")
+    if not identity_found:
+        raise _ScanError(f"Official feed lacks matching {profile['platform']} platform identity; refusing another vendor or release.")
     return generated.isoformat()
 
 
@@ -251,7 +272,8 @@ def run_scan(output_dir):
     """Return a complete/incomplete report; never reuse an output directory."""
     report = {"status": "incomplete", "counts": {}, "findings": [],
               "limitations": list(_LIMITATIONS), "started_at": _now().isoformat(),
-              "provenance": {"feed": {"url": FEED_URL}, "engine": {"name": "OpenSCAP"}},
+              "platform": None,
+              "provenance": {"feed": {}, "engine": {"name": "OpenSCAP"}},
               "artifacts": {}}
     try:
         output, directory_fd = _new_directory(output_dir)
@@ -264,15 +286,30 @@ def run_scan(output_dir):
     phase = "host prerequisites"
     try:
         if platform.system() != "Linux":
-            raise _ScanError("Only local Ubuntu 24.04 Linux is supported.")
-        release = platform.freedesktop_os_release()
-        if release.get("ID") != "ubuntu" or release.get("VERSION_ID") != "24.04":
-            raise _ScanError("Only local Ubuntu 24.04 Linux is supported.")
+            raise _ScanError("Only local Linux hosts are supported.")
+        profile = select_profile(platform.freedesktop_os_release())
+        report["platform"] = profile
+        report["provenance"]["feed"].update({
+            "url": profile["feed_url"], "kind": profile["feed_kind"],
+            "finding_classes": profile["finding_classes"], "source_url": profile["source_url"],
+        })
+        if profile["scan_unavailable"]:
+            raise _ScanError(profile["scan_unavailable"])
+        report["limitations"].append(
+            f"{profile['label']}: {profile['feed_kind']} definitions only. "
+            "Patch findings mean vendor security advisories apply, not a complete inventory of all CVEs. "
+            "Only vendor-covered packages, releases, repositories and support entitlements are represented.")
+        if profile["id"] == "rhel":
+            report["limitations"].append(
+                "RHEL base-stream security advisories only; EUS/E4S/AUS/TUS and layered-product streams are not evaluated.")
         if os.geteuid() != 0:
             raise _ScanError("Run as root to provide authenticated local probe access.")
         executable = shutil.which("oscap", path=_ENV["PATH"])
         if executable is None:
-            raise _ScanError("OpenSCAP is not installed; install the openscap-scanner system package.")
+            if profile["oscap_package"] is None:
+                raise _ScanError("OpenSCAP is not installed; Debian 11 has no scanner package in its release repository. "
+                                 "A compatible, trusted OpenSCAP installation is required; do not mix distribution repositories.")
+            raise _ScanError(f"OpenSCAP is not installed; install the {profile['oscap_package']} system package for {profile['label']}.")
         phase = "OpenSCAP version"
         with _private_file(directory_fd, "engine-version.txt") as version_output:
             code = _execute([executable, "--version"], directory_fd, root, 15, version_output)
@@ -283,10 +320,10 @@ def run_scan(output_dir):
             raise _ScanError("Could not determine the installed OpenSCAP version.")
         report["provenance"]["engine"].update({"version": version.group(1).decode("ascii"), "path": executable})
         phase = "official feed download"
-        report["provenance"]["feed"].update(_download(directory_fd))
+        report["provenance"]["feed"].update(_download(directory_fd, profile))
         phase = "official feed validation"
         report["provenance"]["feed"].update(_unpack(directory_fd, root))
-        report["provenance"]["feed"]["generated_at"] = _validate_feed(root / "feed.xml")
+        report["provenance"]["feed"]["generated_at"] = _validate_feed(root / "feed.xml", profile)
         phase = "OpenSCAP evaluation"
         args = [executable, "oval", "eval", "--results", str(root / "results.xml"),
                 "--report", str(root / "report.html"), str(root / "feed.xml")]
@@ -297,7 +334,8 @@ def run_scan(output_dir):
             info = (root / name).lstat()
             if not stat.S_ISREG(info.st_mode) or info.st_size == 0:
                 raise _ScanError("OpenSCAP did not produce regular, nonempty XML and HTML results.")
-        parsed = parse_results(root / "results.xml", root / "feed.xml")
+        parsed = parse_results(root / "results.xml", root / "feed.xml",
+                               finding_classes=tuple(profile["finding_classes"]), host_platform=profile["platform"])
         report.update({key: parsed[key] for key in ("status", "counts", "findings")})
         report["limitations"].extend(parsed["limitations"])
         # Unlike XCCDF, `oval eval` documents only zero as successful evaluation.
