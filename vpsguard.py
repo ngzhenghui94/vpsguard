@@ -788,6 +788,8 @@ def parser():
     result = argparse.ArgumentParser(description=__doc__, epilog='No command means audit. Keep provider-console access. Plan is read-only; apply requires exact digest approval and a fresh independent key+sudo SSH proof. No packages are installed.')
     sub = result.add_subparsers(dest='command')
     sub.add_parser('audit', help='Read-only host observations, returned as JSON')
+    scan = sub.add_parser('scan', help='Evaluate local Ubuntu package vulnerabilities with OpenSCAP')
+    scan.add_argument('--output', required=True, metavar='DIR', help='New private directory for scan evidence and reports')
     for name in ('plan', 'apply'):
         command = sub.add_parser(name, help='Inspect and print a read-only plan' if name == 'plan' else 'Prepare/resume an explicitly approved transaction')
         command.add_argument('--allow', type=allow_port, action='append', required=True, metavar='tcp:PORT', help='Repeat for EVERY externally bound TCP/UDP service, including SSH')
@@ -809,6 +811,9 @@ def main(argv=None):
         if args.command in (None, 'audit'):
             from audit import run_audit
             output = run_audit()
+        elif args.command == 'scan':
+            from scanner import main as scan_main
+            return scan_main(['--output', args.output])
         elif args.command == 'plan':
             output = preflight(args.allow)
         elif args.command == 'apply':
