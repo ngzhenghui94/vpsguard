@@ -53,6 +53,16 @@ def _os_release():
     return values
 
 
+def _unsigned(value, maximum):
+    if not value.isascii() or not value.isdecimal():
+        return None
+    try:
+        number = int(value)
+    except ValueError:
+        return None
+    return number if number <= maximum else None
+
+
 def _ssh():
     text, error = _run(["sshd", "-T"])
     if error:
@@ -60,7 +70,7 @@ def _ssh():
     settings = {}
     for line in text.splitlines():
         key, separator, value = line.partition(" ")
-        if separator and key in _SSH_KEYS:
+        if separator and key in _SSH_KEYS and value.strip():
             settings.setdefault(key, []).append(value.strip())
     required = {"port", "permitrootlogin", "passwordauthentication", "pubkeyauthentication"}
     status = "ok" if required <= settings.keys() else "unknown"
@@ -80,12 +90,13 @@ def _listeners():
         if len(fields) < 6 or fields[0] not in {"tcp", "udp"}:
             malformed = True
             continue
-        address, separator, port = fields[4].rpartition(":")
-        if not separator or not port.isdigit() or not 0 < int(port) <= 65535:
+        address, separator, value = fields[4].rpartition(":")
+        port = _unsigned(value, 65535)
+        if not separator or not port:
             malformed = True
             continue
         listeners.append({"protocol": fields[0], "address": address.strip("[]"),
-                          "port": int(port)})
+                          "port": port})
     return _check("unknown" if malformed else "ok", {"listeners": listeners},
                   "Local network namespace only; listeners do not prove Internet reachability.")
 
@@ -95,12 +106,11 @@ def _firewall():
     if error:
         return _check("unknown", note=error + " Non-UFW rules were not inspected.")
     lines = [line.split("#", 1)[0].rstrip() for line in text.splitlines()]
-    if "Status: active" in lines:
-        status, active = "ok", True
-    elif "Status: inactive" in lines:
-        status, active = "warning", False
-    else:
-        return _check("unknown", note="UFW returned an unrecognized status.")
+    active = "Status: active" in lines
+    inactive = "Status: inactive" in lines
+    if active == inactive:
+        return _check("unknown", note="UFW returned an unrecognized or conflicting status.")
+    status = "ok" if active else "warning"
     return _check(status, {"backend": "ufw", "active": active, "rules": lines},
                   "UFW view only: other nftables/iptables rules, cloud firewalls and Docker "
                   "forwarding are not established by this output.")
@@ -158,22 +168,25 @@ def _accounts():
     if error:
         return _check("unknown", note=error)
     privileged_groups = {}
-    malformed = False
+    malformed = not groups.strip()
     for line in groups.splitlines():
         fields = line.split(":")
-        if len(fields) != 4 or not fields[2].isdigit():
+        gid = _unsigned(fields[2], 4294967295) if len(fields) == 4 else None
+        if gid is None:
             malformed = True
             continue
         if fields[0] in {"sudo", "admin"}:
-            privileged_groups[fields[0]] = (int(fields[2]), set(filter(None, fields[3].split(","))))
+            privileged_groups[fields[0]] = (gid, set(filter(None, fields[3].split(","))))
     accounts = []
     seen = set()
     for line in passwd.splitlines():
         fields = line.split(":")
-        if len(fields) != 7 or not fields[2].isdigit() or not fields[3].isdigit():
+        uid = _unsigned(fields[2], 4294967295) if len(fields) == 7 else None
+        gid = _unsigned(fields[3], 4294967295) if len(fields) == 7 else None
+        if uid is None or gid is None:
             malformed = True
             continue
-        name, uid, gid = fields[0], int(fields[2]), int(fields[3])
+        name = fields[0]
         seen.add(name)
         memberships = [group for group, (group_id, members) in privileged_groups.items()
                        if gid == group_id or name in members]
@@ -192,12 +205,15 @@ def _docker():
                         '{{json .Ports}}'])
     if error:
         return _check("unknown", note=error + " Docker absence or port safety is not established.")
+    if not text.strip():
+        return _check("unknown", note="Docker returned no container observations; "
+                      "Docker absence or port safety is not established.")
     published = []
     malformed = False
     for line in text.splitlines():
         try:
             ports = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
             malformed = True
             continue
         if not isinstance(ports, str):
@@ -214,7 +230,8 @@ def run_audit():
     """Return JSON-safe observations without changing files, packages, services or firewall rules.
 
     ``checks`` maps names to ``status`` (ok/warning/unknown), ``data`` and ``note``.
-    ``ok`` means the scoped observation succeeded, not that the host is secure.
+    ``ok`` means the scoped observation succeeded without a known warning, not that
+    the host is secure. Incomplete observations stay ``unknown`` even with warnings.
     Unsupported hosts return empty checks and never invoke host commands.
     """
     release = _os_release()
@@ -228,7 +245,10 @@ def run_audit():
     for name, collect in (("ssh", _ssh), ("listeners", _listeners), ("firewall", _firewall),
                           ("security_updates", _updates), ("privileged_accounts", _accounts),
                           ("docker", _docker)):
-        checks[name] = collect()
+        try:
+            checks[name] = collect()
+        except (OSError, ValueError):
+            checks[name] = _check("unknown", note="Observation could not be collected or parsed.")
         if checks[name]["status"] != "ok":
             report["findings"].append({"check": name, "severity": checks[name]["status"],
                                        "message": checks[name].get("note", "Review required.")})
@@ -244,4 +264,7 @@ def run_audit():
         if account["uid"] == 0 and account["name"] != "root":
             report["findings"].append({"check": "privileged_accounts", "severity": "warning",
                                        "message": f"Additional UID 0 account: {account['name']}"})
+    for finding in report["findings"]:
+        if finding["severity"] == "warning" and checks[finding["check"]]["status"] == "ok":
+            checks[finding["check"]]["status"] = "warning"
     return report

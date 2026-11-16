@@ -50,11 +50,14 @@ def run(*args, ok=(0,), timeout=60):
     try:
         result = subprocess.run(args, text=True, capture_output=True, timeout=timeout,
                                 env={'PATH': SAFE_PATH, 'LC_ALL': 'C', 'HOME': '/root'})
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise Refusal(f'Cannot execute {args[0]}: {exc}') from exc
+    except subprocess.TimeoutExpired as exc:
+        raise Refusal(f'{args[0]} timed out; command arguments and output [REDACTED].') from exc
+    except OSError as exc:
+        raise Refusal(f'Cannot execute {args[0]} (errno {exc.errno}); details [REDACTED].') from exc
+    except UnicodeError as exc:
+        raise Refusal(f'{args[0]} returned invalid text; output [REDACTED].') from exc
     if result.returncode not in ok:
-        raise Refusal(f'{shlex.join(args)} failed ({result.returncode}): '
-                      f'{result.stderr.strip() or result.stdout.strip()}')
+        raise Refusal(f'{args[0]} failed ({result.returncode}); command arguments and output [REDACTED].')
     return result
 
 
@@ -183,17 +186,17 @@ def exposed_ports(text):
     for line in text.splitlines():
         fields = line.split()
         if len(fields) < 6 or fields[0] not in ('tcp', 'udp'):
-            raise Refusal(f'Unrecognized ss listener: {line}')
+            raise Refusal('Unrecognized ss listener: [REDACTED].')
         host, separator, port = fields[4].rpartition(':')
         if not separator or not port.isdecimal() or not 1 <= int(port) <= 65535:
-            raise Refusal(f'Unrecognized listener address: {fields[4]}')
+            raise Refusal('Unrecognized listener address: [REDACTED].')
         host = host.strip('[]').split('%', 1)[0]
         if host != '*':
             try:
                 if ipaddress.ip_address(host).is_loopback:
                     continue
             except ValueError as exc:
-                raise Refusal(f'Unrecognized listener address: {host}') from exc
+                raise Refusal('Unrecognized listener address: [REDACTED].') from exc
         ports.add(f'{fields[0]}:{int(port)}')
     return sorted(ports)
 
@@ -209,16 +212,16 @@ def firewall_inventory(text):
         elif line.startswith(':'):
             chain = line[1:].split()[0]
             if chain not in {'INPUT', 'FORWARD', 'OUTPUT', 'PREROUTING', 'POSTROUTING'} and not chain.startswith('ufw-'):
-                raise Refusal(f'Unmanaged firewall chain {chain}; Docker/CNI rules are not protected by UFW.')
+                raise Refusal('Unmanaged firewall chain [REDACTED]; Docker/CNI rules are not protected by UFW.')
         elif line.startswith('-A '):
             fields = shlex.split(line)
             if table != 'filter':
                 raise Refusal('Existing NAT/raw/mangle rules are unsupported; no firewall reset is performed.')
             if not fields[1].startswith('ufw-'):
                 if len(fields) != 4 or fields[2] != '-j' or not fields[3].startswith('ufw-'):
-                    raise Refusal(f'Unmanaged firewall rule: {line}')
+                    raise Refusal('Unmanaged firewall rule: [REDACTED].')
         else:
-            raise Refusal(f'Unrecognized firewall inventory: {line}')
+            raise Refusal('Unrecognized firewall inventory: [REDACTED].')
 
 
 def ssh_configuration():
@@ -287,11 +290,7 @@ def preflight(allow):
     missing = sorted(set(listeners) - set(allow))
     if missing:
         raise Refusal(f'Allow every non-loopback listener explicitly before proceeding: {", ".join(missing)}')
-    for command in ('iptables-save', 'ip6tables-save'):
-        saved = run(command)
-        if saved.stderr.strip():
-            raise Refusal(f'Firewall inspection reported uncertainty: {saved.stderr.strip()}')
-        firewall_inventory(saved.stdout)
+    firewall = firewall_snapshot()
     nft = json.loads(run('nft', '-j', 'list', 'ruleset').stdout)
     for entry in nft.get('nftables', []):
         if 'table' in entry:
@@ -304,7 +303,7 @@ def preflight(allow):
             continue
         match = re.fullmatch(r'ufw allow ([0-9]+)/(tcp|udp)', line)
         if not match or f'{match[2]}:{int(match[1])}' not in allow:
-            raise Refusal(f'Existing UFW rule needs manual review: {line}. No rules are deleted/reset.')
+            raise Refusal('Existing UFW rule needs manual review: [REDACTED]. No rules are deleted/reset.')
     ufw_status = run('ufw', 'status').stdout
     if not (ufw_status.startswith('Status: active\n') or ufw_status.strip() == 'Status: inactive'):
         raise Refusal('Cannot determine UFW state.')
@@ -323,7 +322,7 @@ def preflight(allow):
     apt_inputs = snapshot((APT_DROP.parent, Path('/etc/apt/apt.conf')))
     plan = {'version': 1, 'allow': allow, 'ssh_port': int(ssh['port'][0]),
             'listeners': listeners, 'ufw_active': ufw_status.startswith('Status: active\n'),
-            'files': files, 'apt_inputs': apt_inputs,
+            'files': files, 'apt_inputs': apt_inputs, 'firewall': firewall,
             'changes': ['SSH: public keys only; disable root and password/keyboard-interactive login',
                         'UFW: preserve existing rules, add listed ports, deny incoming, allow outgoing, enable IPv4/IPv6',
                         'APT: automatic Ubuntu noble-security updates only; no automatic reboot'],
@@ -335,7 +334,7 @@ def preflight(allow):
 
 
 def transaction_path(identifier):
-    if not re.fullmatch(r'[0-9a-f]{24}', identifier):
+    if not isinstance(identifier, str) or not re.fullmatch(r'[0-9a-f]{24}', identifier):
         raise Refusal('Invalid transaction identifier.')
     return STATE / identifier
 
@@ -353,9 +352,18 @@ def load_state(identifier=None):
     path = transaction_path(identifier) / 'state.json'
     if not trusted(path):
         raise Refusal('Transaction does not exist.')
-    state = json.loads(path.read_text())
-    if state.get('id') != identifier or state.get('version') != 1:
-        raise Refusal('Invalid transaction state.')
+    try:
+        state = json.loads(path.read_text())
+    except (ValueError, UnicodeError) as exc:
+        raise Refusal('Invalid transaction state; use provider console.') from exc
+    statuses = TERMINAL | {'awaiting_access', 'arming', 'applying', 'applied',
+                           'rolling_back', 'rollback_failed'}
+    if (not isinstance(state, dict) or state.get('id') != identifier or state.get('version') != 1
+            or not isinstance(state.get('status'), str) or state['status'] not in statuses
+            or not isinstance(state.get('plan'), dict)
+            or type(state['plan'].get('ufw_active')) is not bool):
+        raise Refusal('Invalid transaction state; use provider console.')
+    validate_backup_plan(state['plan'])
     return state
 
 
@@ -369,6 +377,8 @@ def backup(plan, identifier):
             if hashlib.sha256(data).hexdigest() != item['sha256']:
                 raise Refusal(f'Configuration changed during backup: {name}; re-plan.')
             atomic_write(directory / 'backup' / hashlib.sha256(name.encode()).hexdigest(), data)
+    if snapshot() != plan['files']:
+        raise Refusal('Configuration changed during backup; re-plan.')
     atomic_write(directory / 'runner.py', Path(__file__).read_bytes())
     sync_dir(directory)
     sync_dir(STATE)
@@ -519,13 +529,83 @@ def change_configuration(state):
     run('systemctl', 'is-active', '--quiet', 'ssh.service')
 
 
+def firewall_snapshot():
+    result = {}
+    for command in ('iptables-save', 'ip6tables-save'):
+        saved = run(command)
+        if saved.stderr.strip():
+            raise Refusal('Firewall inspection reported uncertainty: [REDACTED].')
+        firewall_inventory(saved.stdout)
+        result[command] = [' '.join(line.split()[:2]) if line.startswith(':') else line
+                           for raw in saved.stdout.splitlines() for line in [raw.strip()]
+                           if line and not line.startswith('#')]
+    return result
+
+
+def firewall_state(allow):
+    """Check both live families and retain counter-independent rules for confirmation."""
+    if not run('ufw', 'status').stdout.startswith('Status: active\n'):
+        raise Refusal('UFW is not active; rollback remains armed.')
+    result = firewall_snapshot()
+    for lines in result.values():
+        table = None
+        filtering = []
+        for line in lines:
+            if line.startswith('*'):
+                table = line
+            elif table == '*filter':
+                filtering.append(line)
+        rules = [shlex.split(line) for line in filtering if line.startswith('-A ')]
+        policies = {parts[0]: parts[1] for line in filtering if line.startswith(':')
+                    for parts in [line.split()] if len(parts) >= 2}
+        if policies.get(':INPUT') != 'DROP' or policies.get(':OUTPUT') != 'ACCEPT':
+            raise Refusal('Live firewall default policies do not match the approved plan.')
+        for source, target in (('INPUT', 'ufw-before-input'), ('ufw-before-input', 'ufw-user-input')):
+            if ['-A', source, '-j', target] not in rules:
+                raise Refusal('Live firewall is missing a required UFW input hook.')
+        for item in allow:
+            protocol, port = item.split(':')
+            if ['-A', 'ufw-user-input', '-p', protocol, '-m', protocol,
+                    '--dport', port, '-j', 'ACCEPT'] not in rules:
+                raise Refusal('Live firewall is missing an approved service rule.')
+    return result
+
+
+def validate_backup_plan(plan):
+    if (not isinstance(plan, dict) or type(plan.get('ufw_active')) is not bool
+            or not isinstance(plan.get('firewall'), dict)
+            or plan.get('digest') != digest({key: value for key, value in plan.items() if key != 'digest'})):
+        raise Refusal('Corrupt backup plan; use provider console.')
+    files = plan.get('files')
+    if not isinstance(files, dict) or any(str(root) not in files for root in TARGETS):
+        raise Refusal('Incomplete backup manifest; use provider console.')
+    for name, item in files.items():
+        path = Path(name)
+        if (not path.is_absolute() or '..' in path.parts or str(path) != name
+                or not any(path == root or root in path.parents for root in TARGETS)
+                or not isinstance(item, dict) or item.get('kind') not in ('absent', 'file', 'directory')):
+            raise Refusal('Invalid backup manifest; use provider console.')
+        if item['kind'] == 'absent':
+            if path not in TARGETS:
+                raise Refusal('Invalid absent backup entry; use provider console.')
+            continue
+        if any(type(item.get(key)) is not int or item[key] < 0 for key in ('mode', 'uid', 'gid')):
+            raise Refusal('Invalid backup metadata; use provider console.')
+        if item['mode'] > 0o7777 or item['mode'] & 0o022:
+            raise Refusal('Unsafe backup metadata; use provider console.')
+        if item['kind'] == 'file' and (not isinstance(item.get('sha256'), str)
+                                      or not re.fullmatch(r'[0-9a-f]{64}', item['sha256'])):
+            raise Refusal('Invalid backup digest; use provider console.')
+        if path not in TARGETS and files.get(str(path.parent), {}).get('kind') != 'directory':
+            raise Refusal('Incomplete backup directory manifest; use provider console.')
+
+
 def validate_backups(state):
     files = state['plan']['files']
+    validate_backup_plan(state['plan'])
     directory = transaction_path(state['id'])
     data = {}
     for name, item in files.items():
-        if not any(Path(name) == root or root in Path(name).parents for root in TARGETS):
-            raise Refusal(f'Backup path outside managed scope: {name}')
         if item['kind'] == 'file':
             path = directory / 'backup' / hashlib.sha256(name.encode()).hexdigest()
             if not trusted(path):
@@ -567,6 +647,12 @@ def restore_configuration(state):
             atomic_write(path, data[name], item['mode'])
         os.chown(path, item['uid'], item['gid'])
         os.chmod(path, item['mode'])
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        sync_dir(path.parent)
     run('sshd', '-t')
     run('ufw', '--dry-run', 'enable' if state['plan']['ufw_active'] else 'disable')
     if state['plan']['ufw_active']:
@@ -576,13 +662,21 @@ def restore_configuration(state):
         run('ufw', '--force', 'disable')
     run('systemctl', 'reload', 'ssh.service')
     run('systemctl', 'is-active', '--quiet', 'ssh.service')
+    status = run('ufw', 'status').stdout
+    active = status.startswith('Status: active\n')
+    if (active if state['plan']['ufw_active'] else status.strip() == 'Status: inactive') is not True:
+        raise Refusal('Restored UFW state could not be verified.')
+    if snapshot() != files:
+        raise Refusal('Restored configuration differs from its backup; use provider console.')
+    if firewall_snapshot() != state['plan'].get('firewall'):
+        raise Refusal('Restored live firewall differs from its backup; use provider console.')
 
 
 def rollback_locked(state):
     if state['status'] in TERMINAL:
         disarm_rollback(state)
         return {'id': state['id'], 'status': state['status']}
-    if state['status'] == 'awaiting_access':
+    if state['status'] in ('awaiting_access', 'arming'):
         state['status'] = 'rolled_back'
         save_state(state)
         disarm_rollback(state)
@@ -591,7 +685,7 @@ def rollback_locked(state):
     save_state(state)
     try:
         restore_configuration(state)
-    except Exception as exc:
+    except (Exception, KeyboardInterrupt) as exc:
         state['status'] = 'rollback_failed'
         state['error'] = str(exc)
         save_state(state)
@@ -633,22 +727,31 @@ def apply_plan(allow, approval, rollback_minutes):
             state['created_at'] = time.time()
             save_state(state)
             raise Refusal('Access proof expired. Open a new SSH connection and run verify-access again.')
+        validate_backups(state)
+        if snapshot() != plan['files']:
+            raise Refusal('Configuration changed since preflight; re-plan before applying.')
         state['deadline'] = time.time() + rollback_minutes * 60
         state['status'] = 'arming'
         save_state(state)
-        arm_rollback(state)
-        if time.time() >= state['deadline']:
-            rollback_locked(state)
-            raise Refusal('Rollback deadline elapsed while arming; no hardening changes were started.')
-        state['status'] = 'applying'
-        save_state(state)
         try:
+            arm_rollback(state)
+            if time.time() >= state['deadline']:
+                raise Refusal('Rollback deadline elapsed while arming; no hardening changes were started.')
+            if snapshot() != plan['files']:
+                raise Refusal('Configuration changed while arming; no hardening changes were started.')
+        except (Exception, KeyboardInterrupt) as exc:
+            rollback_locked(state)
+            raise Refusal(f'Apply aborted before hardening changes: {exc}') from exc
+        try:
+            state['status'] = 'applying'
+            save_state(state)
             change_configuration(state)
             state['changed_at'] = time.time()
             state['applied_files'] = snapshot()
+            state['applied_firewall'] = firewall_state(plan['allow'])
             state['status'] = 'applied'
             save_state(state)
-        except Exception as exc:
+        except (Exception, KeyboardInterrupt) as exc:
             rollback_locked(state)
             raise Refusal(f'Apply failed and configuration was rolled back: {exc}') from exc
         return {'id': state['id'], 'status': 'applied', 'rollback_at': state['deadline'],
@@ -669,8 +772,8 @@ def confirm(identifier):
         validate_effective()
         if snapshot() != state['applied_files']:
             raise Refusal('Managed configuration changed since apply; refusing confirmation. Rollback remains armed.')
-        if not run('ufw', 'status').stdout.startswith('Status: active\n'):
-            raise Refusal('UFW is no longer active; rollback remains armed.')
+        if firewall_state(state['plan']['allow']) != state.get('applied_firewall'):
+            raise Refusal('Live firewall changed since apply; refusing confirmation. Rollback remains armed.')
         if time.time() >= state['deadline']:
             rollback_locked(state)
             raise Refusal('The confirmation deadline elapsed during verification; rollback completed.')

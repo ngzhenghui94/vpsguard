@@ -149,6 +149,16 @@ class AuditTests(unittest.TestCase):
         with patch.object(audit, "_run", return_value=("not json\n", None)):
             self.assertEqual(audit._docker()["status"], "unknown")
 
+    def test_malformed_docker_json_preserves_valid_observations(self):
+        published = "*:8080->80/tcp"
+        for malformed in ("9" * 5000, "[" * 10000 + "]" * 10000, '{"Ports": "unexpected"}'):
+            text = json.dumps(published) + "\n" + malformed + "\n"
+            with self.subTest(value=malformed[:12]), \
+                    patch.object(audit, "_run", return_value=(text, None)):
+                result = audit._docker()
+            self.assertEqual(result["status"], "unknown")
+            self.assertEqual(result["data"]["published_ports"], [published])
+
     def test_supported_report_is_json_safe_when_commands_are_missing(self):
         with patch.object(audit.platform, "system", return_value="Linux"), \
                 patch.object(audit, "_os_release", return_value={"ID": "ubuntu", "VERSION_ID": "24.04"}), \
@@ -160,6 +170,124 @@ class AuditTests(unittest.TestCase):
         self.assertTrue(all(check["status"] == "unknown" for check in report["checks"].values()))
         self.assertEqual(len(report["findings"]), 6)
         json.dumps(report)
+
+    def test_empty_command_output_does_not_establish_security_state(self):
+        for collect in (audit._ssh, audit._firewall, audit._docker):
+            for text in ("", " \n"):
+                with self.subTest(collector=collect.__name__, text=text), \
+                        patch.object(audit, "_run", return_value=(text, None)):
+                    result = collect()
+                self.assertEqual(result["status"], "unknown")
+                self.assertNotIn("active", result["data"])
+        with patch.object(audit, "_run", return_value=('""\n', None)):
+            self.assertEqual(audit._docker()["status"], "ok")
+
+    def test_empty_required_ssh_values_are_unknown(self):
+        text = "port 22\npermitrootlogin no\npasswordauthentication \npubkeyauthentication yes\n"
+        with patch.object(audit, "_run", return_value=(text, None)):
+            self.assertEqual(audit._ssh()["status"], "unknown")
+
+    def test_conflicting_firewall_status_is_unknown(self):
+        text = "Status: active\nStatus: inactive\nprivate-diagnostic\n"
+        with patch.object(audit, "_run", return_value=(text, None)):
+            result = audit._firewall()
+        self.assertEqual(result["status"], "unknown")
+        self.assertNotIn("active", result["data"])
+        self.assertNotIn("private-diagnostic", json.dumps(result))
+
+    def test_malformed_listener_ports_preserve_valid_observations(self):
+        valid = "tcp LISTEN 0 128 *:22 *:*\n"
+        for value in ("²", "１２", "9" * 5000, "65536", "0"):
+            with self.subTest(value=value[:12]), \
+                    patch.object(audit, "_run", return_value=(valid + f"tcp LISTEN 0 128 *:{value} *:*\n", None)):
+                result = audit._listeners()
+            self.assertEqual(result["status"], "unknown")
+            self.assertEqual(result["data"]["listeners"], [
+                {"protocol": "tcp", "address": "*", "port": 22},
+            ])
+
+    def test_malformed_account_ids_preserve_valid_observations(self):
+        root = "root:x:0:0:Root:/root:/bin/bash\n"
+        for value in ("²", "１２", "9" * 5000, "4294967296"):
+            for field in ("uid", "gid", "group"):
+                uid = value if field == "uid" else "1000"
+                gid = value if field == "gid" else "1000"
+                group_id = value if field == "group" else "27"
+                entries = root + f"ordinary:x:{uid}:{gid}:User:/home/user:/bin/bash\n"
+                groups = f"root:x:0:\nsudo:x:{group_id}:\n"
+                with self.subTest(field=field, value=value[:12]), \
+                        patch.object(audit, "_run", side_effect=[(entries, None), (groups, None)]):
+                    result = audit._accounts()
+                self.assertEqual(result["status"], "unknown")
+                self.assertEqual(result["data"]["accounts"], [{"name": "root", "uid": 0, "groups": []}])
+
+    def test_empty_groups_do_not_establish_privileged_memberships(self):
+        entries = "root:x:0:0:Root:/root:/bin/bash\n"
+        with patch.object(audit, "_run", side_effect=[(entries, None), ("", None)]):
+            result = audit._accounts()
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["data"]["accounts"][0]["name"], "root")
+
+    def test_collector_os_and_parse_failures_are_scoped_without_diagnostics(self):
+        for failure in (OSError("private-key"), ValueError("secret-token"),
+                        UnicodeDecodeError("utf8", b"\xff", 0, 1, "private-diagnostic")):
+            with self.subTest(failure=type(failure).__name__), \
+                    patch.object(audit.platform, "system", return_value="Linux"), \
+                    patch.object(audit, "_os_release", return_value={"ID": "ubuntu", "VERSION_ID": "24.04"}), \
+                    patch.object(audit, "_ssh", side_effect=failure), \
+                    patch.object(audit, "_cache_age", return_value=None), \
+                    patch.object(audit, "_run", return_value=(None, "Command is not installed.")), \
+                    patch.object(audit, "_docker", return_value=audit._check("ok", {"published_ports": []})) as docker:
+                report = audit.run_audit()
+            self.assertEqual(len(report["checks"]), 6)
+            self.assertEqual(report["checks"]["ssh"]["status"], "unknown")
+            self.assertEqual(report["checks"]["docker"]["status"], "ok")
+            docker.assert_called_once_with()
+            encoded = json.dumps(report)
+            for secret in ("private-key", "secret-token", "private-diagnostic"):
+                self.assertNotIn(secret, encoded)
+
+    def test_collector_programming_errors_are_not_suppressed(self):
+        for failure in (TypeError("bug"), KeyError("bug"), AttributeError("bug"), RuntimeError("bug")):
+            with self.subTest(failure=type(failure).__name__), \
+                    patch.object(audit.platform, "system", return_value="Linux"), \
+                    patch.object(audit, "_os_release", return_value={"ID": "ubuntu", "VERSION_ID": "24.04"}), \
+                    patch.object(audit, "_ssh", side_effect=failure):
+                with self.assertRaises(type(failure)):
+                    audit.run_audit()
+
+    def test_ssh_warning_findings_update_check_status_without_hiding_unknown(self):
+        for key in ("passwordauthentication", "kbdinteractiveauthentication",
+                    "permitemptypasswords", "permitrootlogin"):
+            for complete in (True, False):
+                settings = {"permitrootlogin": "no", "passwordauthentication": "no",
+                            "pubkeyauthentication": "yes", key: "yes"}
+                if complete:
+                    settings["port"] = "22"
+                text = "".join(f"{name} {value}\n" for name, value in settings.items())
+
+                def command(args):
+                    return (text, None) if args[0] == "sshd" else (None, "Command is not installed.")
+
+                with self.subTest(key=key, complete=complete), \
+                        patch.object(audit.platform, "system", return_value="Linux"), \
+                        patch.object(audit, "_os_release", return_value={"ID": "ubuntu", "VERSION_ID": "24.04"}), \
+                        patch.object(audit, "_cache_age", return_value=None), \
+                        patch.object(audit, "_run", side_effect=command):
+                    report = audit.run_audit()
+                self.assertEqual(report["checks"]["ssh"]["status"], "warning" if complete else "unknown")
+                self.assertTrue(any(finding["check"] == "ssh" and finding["severity"] == "warning"
+                                    for finding in report["findings"]))
+
+    def test_additional_root_account_warning_updates_check_status(self):
+        accounts = audit._check("ok", {"accounts": [{"name": "extra", "uid": 0, "groups": []}]})
+        with patch.object(audit.platform, "system", return_value="Linux"), \
+                patch.object(audit, "_os_release", return_value={"ID": "ubuntu", "VERSION_ID": "24.04"}), \
+                patch.object(audit, "_cache_age", return_value=None), \
+                patch.object(audit, "_run", return_value=(None, "Command is not installed.")), \
+                patch.object(audit, "_accounts", return_value=accounts):
+            report = audit.run_audit()
+        self.assertEqual(report["checks"]["privileged_accounts"]["status"], "warning")
 
 
 if __name__ == "__main__":

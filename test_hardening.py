@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -17,6 +18,52 @@ import vpsguard as guard
 
 def success(stdout=''):
     return SimpleNamespace(returncode=0, stdout=stdout, stderr='')
+
+
+class CommandSafetyTests(unittest.TestCase):
+    def test_command_failures_never_echo_arguments_or_output(self):
+        payload = 'private-command-fixture'
+        errors = [subprocess.TimeoutExpired(['tool', payload], 60, output=payload, stderr=payload),
+                  OSError(5, payload), UnicodeDecodeError('utf-8', b'\xff', 0, 1, payload)]
+        for error in errors:
+            with self.subTest(error=type(error).__name__), patch.object(
+                    guard.subprocess, 'run', side_effect=error), self.assertRaises(guard.Refusal) as caught:
+                guard.run('tool', payload)
+            self.assertNotIn(payload, str(caught.exception))
+            self.assertIn('[REDACTED]', str(caught.exception))
+        result = SimpleNamespace(returncode=1, stdout=payload, stderr=payload)
+        with patch.object(guard.subprocess, 'run', return_value=result), self.assertRaises(guard.Refusal) as caught:
+            guard.run('tool', payload)
+        self.assertNotIn(payload, str(caught.exception))
+        self.assertIn('[REDACTED]', str(caught.exception))
+
+
+class FirewallRuntimeTests(unittest.TestCase):
+    rules = ('*filter\n:INPUT DROP [0:0]\n:OUTPUT ACCEPT [0:0]\n'
+             ':ufw-before-input - [0:0]\n:ufw-user-input - [0:0]\n'
+             '-A INPUT -j ufw-before-input\n'
+             '-A ufw-before-input -j ufw-user-input\n'
+             '-A ufw-user-input -p tcp -m tcp --dport 22 -j ACCEPT\nCOMMIT\n')
+
+    def test_both_families_are_checked_and_counters_do_not_cause_drift(self):
+        with patch.object(guard, 'run', side_effect=[
+                success('Status: active\n'), success(self.rules), success(self.rules)]) as command:
+            before = guard.firewall_state(['tcp:22'])
+        self.assertEqual([call.args[0] for call in command.call_args_list],
+                         ['ufw', 'iptables-save', 'ip6tables-save'])
+        with patch.object(guard, 'run', side_effect=[
+                success('Status: active\n'), success(self.rules.replace('[0:0]', '[40:2000]')),
+                success(self.rules)]):
+            self.assertEqual(guard.firewall_state(['tcp:22']), before)
+
+    def test_active_ufw_cannot_hide_missing_ipv6_rule_policy_or_hook(self):
+        invalid = [self.rules.replace(':INPUT DROP', ':INPUT ACCEPT'),
+                   self.rules.replace('-A ufw-before-input -j ufw-user-input\n', ''),
+                   self.rules.replace('-A ufw-user-input -p tcp -m tcp --dport 22 -j ACCEPT\n', '')]
+        for rules in invalid:
+            with self.subTest(rules=rules), patch.object(guard, 'run', side_effect=[
+                    success('Status: active\n'), success(self.rules), success(rules)]), self.assertRaises(guard.Refusal):
+                guard.firewall_state(['tcp:22'])
 
 
 class PolicyTests(unittest.TestCase):
@@ -153,7 +200,7 @@ class TransactionTests(unittest.TestCase):
         self.plan = {'digest': 'approved', 'allow': ['tcp:22'], 'ssh_port': 22, 'files': {}, 'ufw_active': True}
         self.state = {'version': 1, 'id': 'a' * 24, 'status': 'awaiting_access', 'created_at': 100,
                       'plan': self.plan, 'proof': {'verified_at': 190, 'uid': 1000},
-                      'deadline': 500, 'changed_at': 180, 'applied_files': {}}
+                      'deadline': 500, 'changed_at': 180, 'applied_files': {}, 'applied_firewall': {}}
         self.stack.enter_context(patch.object(guard, 'locked', side_effect=contextlib.nullcontext))
         self.stack.enter_context(patch.object(guard, 'preflight', return_value=self.plan))
         self.stack.enter_context(patch.object(guard, 'load_state', side_effect=lambda *args: self.state))
@@ -167,6 +214,8 @@ class TransactionTests(unittest.TestCase):
         self.restore = self.stack.enter_context(patch.object(guard, 'restore_configuration'))
         self.disarm = self.stack.enter_context(patch.object(guard, 'disarm_rollback'))
         self.stack.enter_context(patch.object(guard, 'validate_effective'))
+        self.backups = self.stack.enter_context(patch.object(guard, 'validate_backups'))
+        self.firewall = self.stack.enter_context(patch.object(guard, 'firewall_state', return_value={}))
         self.prove = self.stack.enter_context(patch.object(guard, 'prove_access', return_value={'uid': 1000, 'server_port': 22}))
 
     def test_approval_mismatch_changes_nothing(self):
@@ -207,7 +256,9 @@ class TransactionTests(unittest.TestCase):
         with self.assertRaises(guard.Refusal):
             guard.apply_plan(['tcp:22'], 'approved', 5)
         self.change.assert_not_called()
-        self.assertEqual(self.state['status'], 'arming')
+        self.assertEqual(self.state['status'], 'rolled_back')
+        self.restore.assert_not_called()
+        self.disarm.assert_called_once()
 
     def test_change_failure_restores_before_disarming(self):
         events = []
@@ -269,6 +320,52 @@ class TransactionTests(unittest.TestCase):
         self.restore.assert_not_called()
 
 
+    def test_backup_corruption_blocks_apply_before_timer_or_changes(self):
+        self.backups.side_effect = guard.Refusal('Corrupt backup')
+        with self.assertRaisesRegex(guard.Refusal, 'Corrupt backup'):
+            guard.apply_plan(['tcp:22'], 'approved', 5)
+        self.arm.assert_not_called()
+        self.change.assert_not_called()
+        self.restore.assert_not_called()
+
+    def test_drift_before_and_during_arming_never_restores_or_overwrites(self):
+        for snapshots in ([{'drift': True}], [{}, {'drift': True}]):
+            self.state['status'] = 'awaiting_access'
+            with patch.object(guard, 'snapshot', side_effect=snapshots), self.assertRaises(guard.Refusal):
+                guard.apply_plan(['tcp:22'], 'approved', 5)
+            self.change.assert_not_called()
+            self.restore.assert_not_called()
+
+    def test_interrupt_during_apply_immediately_restores(self):
+        self.change.side_effect = KeyboardInterrupt()
+        with self.assertRaisesRegex(guard.Refusal, 'rolled back'):
+            guard.apply_plan(['tcp:22'], 'approved', 5)
+        self.restore.assert_called_once()
+        self.assertEqual(self.state['status'], 'rolled_back')
+
+    def test_interrupted_restore_retains_retry_and_reports_failure(self):
+        self.state['status'] = 'applied'
+        self.restore.side_effect = KeyboardInterrupt()
+        with self.assertRaisesRegex(guard.Refusal, 'console'):
+            guard.rollback_locked(self.state)
+        self.assertEqual(self.state['status'], 'rollback_failed')
+        self.disarm.assert_not_called()
+
+    def test_scheduled_rollback_of_arming_never_restores(self):
+        self.state['status'] = 'arming'
+        result = guard.rollback_locked(self.state)
+        self.assertFalse(result['changed'])
+        self.restore.assert_not_called()
+
+    def test_live_firewall_drift_prevents_confirmation(self):
+        self.state['status'] = 'applied'
+        self.firewall.return_value = {'ip6tables-save': ['changed']}
+        with self.assertRaisesRegex(guard.Refusal, 'Live firewall changed'):
+            guard.confirm(self.state['id'])
+        self.disarm.assert_not_called()
+        self.assertEqual(self.state['status'], 'applied')
+
+
 class StorageTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -295,10 +392,56 @@ class StorageTests(unittest.TestCase):
             self.stack.enter_context(patch.object(guard, name, value))
         # Ownership checks are covered independently; sandbox files belong to the test user.
         self.stack.enter_context(patch.object(guard, 'trusted', side_effect=lambda path, directory=False: Path(path).exists()))
-        self.stack.enter_context(patch.object(guard, 'run', return_value=success()))
+        self.stack.enter_context(patch.object(guard, 'run', return_value=success('Status: active\n')))
+        self.stack.enter_context(patch.object(guard, 'firewall_snapshot', return_value={}))
         self.state = {'id': 'b' * 24, 'version': 1, 'status': 'applied', 'deadline': 2_000_000_000,
-                      'plan': {'files': guard.snapshot(), 'ufw_active': True}}
+                      'plan': {'files': guard.snapshot(), 'ufw_active': True, 'firewall': {}}}
+        self.state['plan']['digest'] = guard.digest(self.state['plan'])
         guard.backup(self.state['plan'], self.state['id'])
+
+    def test_backup_refuses_changed_bytes_and_new_files(self):
+        self.original.write_text('drift\n')
+        with self.assertRaisesRegex(guard.Refusal, 'changed during backup'):
+            guard.backup(self.state['plan'], 'c' * 24)
+        self.original.write_text('PasswordAuthentication yes\n')
+        self.drop.write_text('new configuration\n')
+        with self.assertRaisesRegex(guard.Refusal, 'changed during backup'):
+            guard.backup(self.state['plan'], 'd' * 24)
+
+    def test_partial_manifest_cannot_delete_original_files(self):
+        del self.state['plan']['files'][str(self.original)]
+        self.original.write_text('live change\n')
+        with self.assertRaisesRegex(guard.Refusal, 'Corrupt backup plan'):
+            guard.restore_configuration(self.state)
+        self.assertEqual(self.original.read_text(), 'live change\n')
+
+    def test_manifest_path_traversal_refused_before_restore(self):
+        name = str(self.ssh_dir) + '/../outside'
+        self.state['plan']['files'][name] = {'kind': 'absent'}
+        self.state['plan'].pop('digest')
+        self.state['plan']['digest'] = guard.digest(self.state['plan'])
+        with self.assertRaisesRegex(guard.Refusal, 'Invalid backup manifest'):
+            guard.restore_configuration(self.state)
+
+    def test_corrupt_state_is_refused_without_restoring(self):
+        path = guard.transaction_path(self.state['id']) / 'state.json'
+        malformed = ['[]', '{', json.dumps(dict(self.state, status='unknown'))]
+        for value in malformed:
+            path.write_text(value)
+            with self.subTest(value=value), self.assertRaises(guard.Refusal):
+                guard.load_state(self.state['id'])
+
+    def test_recovery_drift_and_fsync_failure_never_report_success(self):
+        with patch.object(guard.os, 'chown'), patch.object(guard, 'snapshot', side_effect=[
+                self.state['plan']['files'], {}]), self.assertRaisesRegex(guard.Refusal, 'differs'):
+            guard.restore_configuration(self.state)
+        with patch.object(guard.os, 'fsync', side_effect=OSError('disk failure')), self.assertRaises(OSError):
+            guard.restore_configuration(self.state)
+
+    def test_recovery_runtime_drift_never_reports_success(self):
+        with patch.object(guard.os, 'chown'), patch.object(guard, 'firewall_snapshot', return_value={
+                'ip6tables-save': ['changed']}), self.assertRaisesRegex(guard.Refusal, 'Restored live firewall'):
+            guard.restore_configuration(self.state)
 
     def test_backup_detects_corruption_before_any_restore_write(self):
         name = str(self.original)
