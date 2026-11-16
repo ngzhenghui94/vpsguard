@@ -1,7 +1,9 @@
+import io
 import json
 from pathlib import Path
 import tempfile
 import unittest
+import tracemalloc
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
@@ -261,6 +263,142 @@ class OvalReportTests(unittest.TestCase):
         self.results_path.unlink()
         with self.assertRaises(ValueError):
             oval_report.parse_results(self.results_path, self.feed_path)
+
+    def test_large_irrelevant_trees_are_streamed_and_removed(self):
+        feed = feed_fixture()
+        metadata = feed.find(f"{{{D}}}definitions")[1].find(f"{{{D}}}metadata")
+        metadata.find(f"{{{D}}}description").text = "STREAM_PLACEHOLDER"
+        results = results_fixture([(INVENTORY, "true"), (VULNERABILITY, "true")])
+        embedded = add(results, D, "oval_definitions")
+        add(embedded, D, "definitions").text = "STREAM_PLACEHOLDER"
+        leaf = b"<discard>" + b"x" * 2048 + b"</discard>"
+        for path, root in ((self.feed_path, feed), (self.results_path, results)):
+            before, after = ET.tostring(root, encoding="utf-8").split(b"STREAM_PLACEHOLDER")
+            with path.open("wb") as stream:
+                stream.write(before)
+                for _ in range(8192):
+                    stream.write(leaf)
+                stream.write(after)
+
+        real_open = Path.open
+        reads = []
+
+        class BoundedStream:
+            def __init__(self, path, *args, **kwargs):
+                self.stream = real_open(path, *args, **kwargs)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.stream.close()
+
+            def read(self, size=-1):
+                if not 0 < size <= 64 * 1024:
+                    raise AssertionError("XML must use bounded reads")
+                reads.append(size)
+                return self.stream.read(size)
+
+        tracemalloc.start()
+        try:
+            with patch.object(Path, "open", lambda path, mode: BoundedStream(path, mode)), \
+                    patch.object(Path, "read_bytes", side_effect=AssertionError("Whole-file copy")), \
+                    patch.object(ET, "fromstring", side_effect=AssertionError("Whole-tree parse")), \
+                    patch.object(ET, "iterparse", wraps=ET.iterparse) as parser:
+                report = oval_report.parse_results(self.results_path, self.feed_path)
+                self.assertEqual(parser.call_count, 2)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertGreater(len(reads), 100)
+        self.assertLess(peak, 3 * 1024 * 1024)
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual([finding["id"] for finding in report["findings"]], [VULNERABILITY])
+        self.assertEqual(report["findings"][0]["cves"], ["CVE-2025-1234"])
+
+    def test_reader_validates_split_utf8_and_declaration_tokens(self):
+        safe = '<?xml version="1.0" encoding="UTF-8"?><root>é茶<!-- <!DOCTYPEX --></root>'
+        encoded = b"\xef\xbb\xbf" + safe.encode()
+        reader = oval_report._XMLReader(io.BytesIO(encoded))
+        self.assertEqual("".join(iter(lambda: reader.read(1), "")), safe)
+        unsafe = [
+            b'<?xml version="1.0" encoding="iso-8859-1"?><root/>',
+            b"<root><!-- <!" + b" " * 100000 + b"DOCTYPE root --></root>",
+            b"<root><!-- <!ENTITY x --></root>",
+            b"<root>\x00</root>",
+            b"<root>\xc3",
+        ]
+        for data in unsafe:
+            with self.subTest(data=data[:60]), self.assertRaises(ValueError):
+                reader = oval_report._XMLReader(io.BytesIO(data))
+                while reader.read(7):
+                    pass
+
+    def test_streaming_byte_and_depth_limits_apply_to_both_inputs(self):
+        for target in (self.feed_path, self.results_path):
+            self.parse()
+            size = max(self.feed_path.stat().st_size, self.results_path.stat().st_size)
+            with target.open("ab") as stream:
+                stream.write(b" " * size)
+            with patch.object(oval_report, "MAX_XML_BYTES", size), self.assertRaisesRegex(ValueError, "size limit"):
+                oval_report.parse_results(self.results_path, self.feed_path)
+            self.parse()
+            namespace, name = (D, "oval_definitions") if target == self.feed_path else (R, "oval_results")
+            target.write_text(f'<{name} xmlns="{namespace}">' + "<ignored>" * 256
+                              + "</ignored>" * 256 + f"</{name}>", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "depth limit"):
+                oval_report.parse_results(self.results_path, self.feed_path)
+
+    def test_duplicate_ids_survive_pruning_and_multiple_sections(self):
+        feed = feed_fixture()
+        second = add(feed, D, "definitions")
+        duplicate = ET.fromstring(ET.tostring(feed.find(f"{{{D}}}definitions")[1]))
+        second.append(duplicate)
+        results = results_fixture([(INVENTORY, "true"), (VULNERABILITY, "true")])
+        report = self.parse(results, feed)
+        self.assertIn("The feed contains duplicate definition IDs.", report["limitations"])
+        self.assertEqual(report["findings"], [])
+        results = results_fixture([(INVENTORY, "true"), (VULNERABILITY, "true")])
+        system = results.find(f"{{{R}}}results/{{{R}}}system")
+        second = add(system, R, "definitions")
+        add(second, R, "definition", definition_id=VULNERABILITY, version="1", result="false")
+        report = self.parse(results)
+        self.assertIn("OVAL evidence contains duplicate definition results.", report["limitations"])
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(report["counts"]["true"], 2)
+        self.assertEqual(report["counts"]["false"], 1)
+
+    def test_malformed_duplicate_source_identity_never_produces_a_finding(self):
+        for malformed_first in (False, True):
+            feed = feed_fixture([(VULNERABILITY, "vulnerability")])
+            definitions = feed.find(f"{{{D}}}definitions")
+            del definitions[1 if malformed_first else 2].attrib["version"]
+            with self.subTest(malformed_first=malformed_first):
+                report = self.parse(results_fixture([(INVENTORY, "true"), (VULNERABILITY, "true")]), feed)
+                self.assertEqual(report["status"], "incomplete")
+                self.assertIn("The feed contains duplicate definition IDs.", report["limitations"])
+                self.assertEqual(report["findings"], [])
+
+    def test_pruned_metadata_preserves_namespace_checks(self):
+        for path in ("metadata", "metadata/title", "metadata/reference", "metadata/advisory",
+                     "metadata/advisory/severity", "metadata/advisory/cve"):
+            feed = feed_fixture()
+            definition = feed.find(f"{{{D}}}definitions")[1]
+            element = definition.find("/".join(f"{{{D}}}{part}" for part in path.split("/")))
+            element.tag = "{urn:wrong}" + element.tag.rsplit("}", 1)[-1]
+            with self.subTest(path=path):
+                report = self.parse(feed=feed)
+                self.assertEqual(report["status"], "incomplete")
+                self.assertIn("An OVAL evidence element has the wrong namespace.", report["limitations"])
+
+    def test_streaming_rejects_invalid_trailers_after_complete_evidence(self):
+        for target in (self.feed_path, self.results_path):
+            for trailer in (b"<", b"\xff", b"<!-- <!DOCTYPE hidden -->"):
+                self.parse()
+                with target.open("ab") as stream:
+                    stream.write(trailer)
+                with self.subTest(target=target.name, trailer=trailer), self.assertRaises(ValueError):
+                    oval_report.parse_results(self.results_path, self.feed_path)
 
 
 if __name__ == "__main__":

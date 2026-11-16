@@ -77,6 +77,7 @@ class ScannerTests(unittest.TestCase):
             else:
                 self.assertEqual(args[1:4], ["oval", "eval", "--results"])
                 self.assertEqual(args[5], "--report")
+                self.assertEqual(args[7:], [str(self.output / "feed.xml")])
                 self.assertFalse(kwargs.get("shell", False))
                 self.assertTrue(kwargs["start_new_session"])
                 self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
@@ -212,7 +213,7 @@ class ScannerTests(unittest.TestCase):
                 report, popen, _, _ = self.scan(xml=xml)
                 self.assertEqual(report["status"], "incomplete")
                 self.assertEqual(popen.call_count, 1)
-                self.assertIn("DTDs", " ".join(report["limitations"]))
+                self.assertIn("DTDs" if index == 0 else "UTF-8", " ".join(report["limitations"]))
 
     def test_compression_limits_and_corruption_stop_before_eval(self):
         cases = [("_MAX_COMPRESSED", 1, None), ("_MAX_XML", 32, None),
@@ -226,6 +227,65 @@ class ScannerTests(unittest.TestCase):
                 self.assertEqual(report["status"], "incomplete")
                 self.assertEqual(popen.call_count, 1)
                 self.assertNotIn("secret-token", json.dumps(report))
+
+    def test_feed_growth_remains_bounded_and_reaches_evaluation(self):
+        self.assertEqual(scanner._MAX_XML, 2 * 1024 * 1024 * 1024)
+        former_limit = 64 * 1024
+        xml = feed().replace(b"<definitions>", b"<definitions>" + b" " * (former_limit * 2))
+        for index, limit in enumerate((former_limit, len(xml))):
+            with self.subTest(limit=limit), patch.object(scanner, "_MAX_XML", limit):
+                self.output = self.parent / f"growth-{index}"
+                report, popen, _, _ = self.scan(xml=xml)
+                self.assertEqual(report["status"], "incomplete" if index == 0 else "complete")
+                self.assertEqual(popen.call_count, 1 if index == 0 else 2)
+                if index == 1:
+                    self.assertEqual(report["provenance"]["feed"]["bytes"], len(xml))
+
+    def test_feed_validation_streams_and_enforces_exact_byte_limit(self):
+        xml = feed().replace(b"<definitions>", b"<definitions>" + b" " * (128 * 1024))
+
+        class BoundedReader(io.BytesIO):
+            def read(self, size=-1):
+                if not 0 < size <= 64 * 1024:
+                    raise AssertionError("Feed validation must use bounded reads.")
+                return super().read(size)
+
+        for limit in (len(xml), len(xml) - 1):
+            path = MagicMock()
+            path.open.return_value = BoundedReader(xml)
+            with self.subTest(limit=limit), patch.object(scanner, "_MAX_XML", limit), \
+                    patch.object(scanner, "_now", return_value=NOW):
+                if limit == len(xml):
+                    self.assertEqual(scanner._validate_feed(path), NOW.isoformat())
+                else:
+                    with self.assertRaisesRegex(ValueError, "size limit"):
+                        scanner._validate_feed(path)
+
+    def test_feed_encoding_duplicate_timestamps_and_depth_stop_before_eval(self):
+        duplicate = feed().replace(b"</generator>",
+                                   f"<oval:timestamp>{NOW.isoformat()}</oval:timestamp></generator>".encode())
+        deep = feed().replace(b"<definitions>", b"<definitions>" + b"<nested>" * 256)
+        deep = deep.replace(b"</definitions>", b"</nested>" * 256 + b"</definitions>")
+        cases = [
+            b'<?xml version="1.0" encoding="ISO-8859-1"?>' + feed(),
+            feed().decode().encode("utf-16"),
+            feed().replace(b"Fixture", b"\xffFixture"),
+            duplicate,
+            deep,
+        ]
+        for index, xml in enumerate(cases):
+            with self.subTest(index=index):
+                self.output = self.parent / f"invalid-xml-{index}"
+                report, popen, _, _ = self.scan(xml=xml)
+                self.assertEqual(report["status"], "incomplete")
+                self.assertEqual(popen.call_count, 1)
+
+    def test_utf8_bom_and_split_multibyte_text_are_accepted(self):
+        xml = b'\xef\xbb\xbf<?xml version="1.0" encoding="UTF-8"?>' + feed()
+        offset = xml.index(b"Fixture")
+        xml = xml[:offset] + b" " * (65535 - offset) + "\u00e9".encode() + xml[offset:]
+        report, _, _, _ = self.scan(xml=xml)
+        self.assertEqual(report["status"], "complete")
 
     def test_redirects_cannot_leave_verified_official_https(self):
         handler = scanner._OfficialRedirect()

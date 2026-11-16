@@ -51,7 +51,7 @@ sudo python3 vpsguard.py scan --output /var/lib/vpsguard-scan-001
 
 The output directory must not already exist. Scanning downloads vulnerability definitions and writes local evidence; it does not install fixes or modify firewall/SSH settings. The report contains definition-level findings, Canonical severity and CVE references, evaluation counts, and feed provenance. Raw OVAL results and an HTML report provide supporting evidence.
 
-Run scans as root on Ubuntu 24.04 so local package probes can collect their evidence. The feed is fetched over verified HTTPS; recorded SHA-256 hashes identify the downloaded bytes but are not detached publisher signatures. XML inputs are limited to 256 MiB each, and parsing large feeds/results can use substantial memory. Resource exhaustion, stale feeds, missing evidence, and unsupported evaluations must be treated as incomplete, not as a clean bill of health.
+Run scans as root on Ubuntu 24.04 so local package probes can collect their evidence. The feed is fetched over verified HTTPS; recorded SHA-256 hashes identify the downloaded bytes but are not detached publisher signatures. XML inputs have a 2 GiB ceiling and are parsed incrementally by VPSGuard; OpenSCAP itself can still require substantial memory. Resource exhaustion, stale feeds, missing evidence, and unsupported evaluations must be treated as incomplete, not as a clean bill of health.
 
 Exit codes:
 

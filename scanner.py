@@ -2,6 +2,7 @@
 
 import argparse
 import bz2
+import codecs
 from datetime import datetime, timedelta, timezone
 import hashlib
 import http.client
@@ -21,12 +22,12 @@ import urllib.parse
 import urllib.request
 from xml.parsers import expat
 
-from oval_report import parse_results
+from oval_report import MAX_XML_BYTES, parse_results
 
 
 FEED_URL = "https://security-metadata.canonical.com/oval/com.ubuntu.noble.cve.oval.xml.bz2"
 _MAX_COMPRESSED = 64 * 1024 * 1024
-_MAX_XML = 256 * 1024 * 1024
+_MAX_XML = MAX_XML_BYTES
 _DOWNLOAD_TIMEOUT = 120
 _SOCKET_TIMEOUT = 15
 _SCAN_TIMEOUT = 900
@@ -155,45 +156,69 @@ def _unpack(directory_fd, root):
 def _validate_feed(path):
     parser = expat.ParserCreate(namespace_separator="}")
     stack = []
-    timestamps = []
+    timestamp = None
     text = []
+    timestamp_path = [_OVAL + "oval_definitions", _OVAL + "generator", _COMMON + "timestamp"]
 
     def reject(*args):
         raise _ScanError("Feed XML DTDs and entities are prohibited.")
 
+    def declaration(version, encoding, standalone):
+        if encoding and encoding.lower() not in ("utf-8", "utf8"):
+            raise _ScanError("Feed XML must be UTF-8.")
+
     def start(name, attrs):
         if not stack and name != _OVAL + "oval_definitions":
             raise _ScanError("Feed is not an OVAL definitions document.")
+        if len(stack) >= 256:
+            raise _ScanError("Feed XML exceeds the nesting limit.")
         stack.append(name)
-        if stack == [_OVAL + "oval_definitions", _OVAL + "generator", _COMMON + "timestamp"]:
+        if stack == timestamp_path:
             text.clear()
 
     def characters(value):
-        if stack == [_OVAL + "oval_definitions", _OVAL + "generator", _COMMON + "timestamp"]:
+        if stack == timestamp_path:
             if sum(map(len, text)) + len(value) > 100:
                 raise _ScanError("Feed generator timestamp is invalid.")
             text.append(value)
 
     def end(name):
-        if stack == [_OVAL + "oval_definitions", _OVAL + "generator", _COMMON + "timestamp"]:
-            timestamps.append("".join(text).strip())
+        nonlocal timestamp
+        if stack == timestamp_path:
+            if timestamp is not None:
+                raise _ScanError("Feed must contain exactly one generator timestamp.")
+            timestamp = "".join(text).strip()
         stack.pop()
 
     parser.StartDoctypeDeclHandler = reject
     parser.EntityDeclHandler = reject
     parser.ExternalEntityRefHandler = reject
+    parser.XmlDeclHandler = declaration
     parser.StartElementHandler = start
     parser.CharacterDataHandler = characters
     parser.EndElementHandler = end
+    decoder = codecs.getincrementaldecoder("utf-8-sig")()
+    size = 0
     try:
         with path.open("rb") as source:
-            parser.ParseFile(source)
+            while block := source.read(min(64 * 1024, _MAX_XML - size + 1)):
+                size += len(block)
+                if size > _MAX_XML:
+                    raise _ScanError("Feed XML exceeds the size limit.")
+                if b"\x00" in block:
+                    raise _ScanError("Feed XML must be UTF-8.")
+                decoder.decode(block)
+                parser.Parse(block, False)
+            decoder.decode(b"", final=True)
+            parser.Parse(b"", True)
+    except UnicodeError:
+        raise _ScanError("Feed XML must be UTF-8.") from None
     except expat.ExpatError:
         raise _ScanError("Official feed XML is malformed.") from None
-    if len(timestamps) != 1:
+    if timestamp is None:
         raise _ScanError("Feed must contain exactly one generator timestamp.")
     try:
-        generated = datetime.fromisoformat(timestamps[0].replace("Z", "+00:00"))
+        generated = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
     except ValueError:
         raise _ScanError("Feed generator timestamp is invalid.") from None
     # Canonical's timezone-less OVAL generator timestamps are interpreted as UTC.
