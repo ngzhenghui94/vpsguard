@@ -348,6 +348,47 @@ class OvalReportTests(unittest.TestCase):
         self.assertEqual(self.parse(results, feed, host_platform="openSUSE Leap 16.0")["status"], "complete")
         self.assertEqual(self.parse(results, feed, host_platform="openSUSE Leap 16.1")["status"], "incomplete")
 
+    def test_suse_native_feed_gaps_and_false_release_test_stay_incomplete(self):
+        # Reduced from opensuse.leap.16.0-affected.xml: metadata-only definitions coexist with RPM criteria.
+        platform = "openSUSE Leap 16.0"
+        feed, results = vendor_fixture(platform, classes=("vulnerability", "vulnerability"))
+        definitions = feed.find(f"{{{D}}}definitions")
+        definitions[0].remove(definitions[0].find(f"{{{D}}}criteria"))
+        test_id = "oval:org.opensuse.security:tst:2010063062"
+        object_id = "oval:org.opensuse.security:obj:2009072405"
+        state_id = "oval:org.opensuse.security:ste:2009243663"
+        definitions[1].find(f"{{{D}}}criteria/{{{D}}}criterion").set("test_ref", test_id)
+        test = feed.find(f"{{{D}}}tests")[0]
+        test.tag = f"{{{D}#linux}}rpminfo_test"
+        test.set("id", test_id)
+        test.set("version", "1")
+        test.set("comment", "Leap-release is ==16.0")
+        add(test, D + "#linux", "object", object_ref=object_id)
+        add(test, D + "#linux", "state", state_ref=state_id)
+        obj = add(add(feed, D, "objects"), D + "#linux", "rpminfo_object", id=object_id, version="1")
+        add(obj, D + "#linux", "name", "Leap-release")
+        state = add(add(feed, D, "states"), D + "#linux", "rpminfo_state", id=state_id, version="1")
+        add(state, D + "#linux", "version", "16.0", operation="equals")
+        system = results.find(f"{{{R}}}results/{{{R}}}system")
+        system.find(f"{{{R}}}definitions")[0].set("result", "not evaluated")
+        test_row = system.find(f"{{{R}}}tests")[0]
+        test_row.set("test_id", test_id)
+        test_row.set("version", "1")
+        for platform_result in ("false", "true"):
+            test_row.set("result", platform_result)
+            with self.subTest(platform_result=platform_result):
+                report = self.parse(results, feed, host_platform=platform)
+                self.assertEqual(report["status"], "incomplete")
+                self.assertEqual(report["findings"], [])
+                self.assertEqual(report["counts"], {
+                    "true": 0, "false": 1, "unknown": 0, "error": 0,
+                    "not evaluated": 1, "not applicable": 0,
+                })
+                limitations = ["1 definition result(s) are not evaluated."]
+                if platform_result == "false":
+                    limitations.append("The source feed's platform evidence did not confirm host applicability.")
+                self.assertEqual(report["limitations"], limitations)
+
     def test_mismatched_results_host_is_not_replaced_by_scanner_assertion(self):
         feed, results = vendor_fixture("Debian GNU/Linux 13", platform_test=False)
         info = results.find(f"{{{R}}}results/{{{R}}}system/{{{S}}}oval_system_characteristics/{{{S}}}system_info")

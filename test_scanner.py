@@ -2,16 +2,19 @@ import bz2
 from contextlib import ExitStack, redirect_stdout
 from datetime import datetime, timedelta, timezone
 import hashlib
+import http.client
 import io
 import json
 import os
 from pathlib import Path
 import signal
+import ssl
 import stat
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
+import urllib.error
 import urllib.request
 
 import scanner
@@ -211,6 +214,22 @@ class ScannerTests(unittest.TestCase):
                 if index == 0:
                     self.assertIn("stale", " ".join(report["limitations"]))
 
+    def test_debian_explicit_offset_is_not_reinterpreted_as_utc(self):
+        timestamp = "2026-11-16T11:25:21.188-04:00"
+        xml = feed(timestamp).replace(b"Ubuntu 24.04 LTS", b"Debian GNU/Linux 13")
+        profile = select_profile({"ID": "debian", "VERSION_ID": "13"})
+        for hour, minute, future in ((14, 32, True), (15, 26, False)):
+            path = MagicMock()
+            path.open.return_value = io.BytesIO(xml)
+            now = datetime(2026, 11, 16, hour, minute, tzinfo=timezone.utc)
+            with self.subTest(now=now), patch.object(scanner, "_now", return_value=now):
+                if future:
+                    with self.assertRaisesRegex(ValueError, "timestamp is in the future"):
+                        scanner._validate_feed(path, profile)
+                else:
+                    self.assertEqual(scanner._validate_feed(path, profile),
+                                     "2026-11-16T11:25:21.188000-04:00")
+
     def test_xml_doctype_and_entities_are_rejected_before_eval(self):
         dangerous = b'<!DOCTYPE oval_definitions [<!ENTITY secret SYSTEM "file:///etc/shadow">]>' + feed()
         for index, xml in enumerate((dangerous, dangerous.decode().encode("utf-16"))):
@@ -307,10 +326,40 @@ class ScannerTests(unittest.TestCase):
         redirected = handler.redirect_request(request, None, 302, "Found", {}, FEED_URL)
         self.assertEqual(redirected.full_url, FEED_URL)
 
-    def test_network_failure_is_incomplete_without_sensitive_details(self):
-        with patch.object(scanner, "_download", side_effect=OSError("secret-token")):
-            report, _, _, _ = self.scan()
+    def test_download_failure_categories_are_safe_and_incomplete(self):
+        secret = "https://private-host/secret-token"
+        cases = [
+            (urllib.error.HTTPError(secret, 403, secret, {"Private": secret}, None), "HTTP status 403"),
+            (ssl.SSLCertVerificationError(secret), "TLS certificate verification failure"),
+            (urllib.error.URLError(ssl.SSLCertVerificationError(secret)), "TLS certificate verification failure"),
+            (ssl.SSLError(secret), "TLS connection error"),
+            (urllib.error.URLError(ssl.SSLError(secret)), "TLS connection error"),
+            (TimeoutError(secret), "network timeout"),
+            (urllib.error.URLError(TimeoutError(secret)), "network timeout"),
+            (ConnectionResetError(secret), "network connection error"),
+            (urllib.error.URLError(secret), "network connection error"),
+            (http.client.IncompleteRead(secret.encode()), "HTTP protocol error"),
+            (OSError(secret), "system/network diagnostics withheld"),
+        ]
+        self.addCleanup(cases[0][0].close)
+        for index, (error, reason) in enumerate(cases):
+            with self.subTest(reason=reason, error=type(error).__name__):
+                self.output = self.parent / f"download-error-{index}"
+                with patch.object(scanner, "_download", side_effect=error):
+                    report, popen, _, _ = self.scan()
+                self.assertEqual(report["status"], "incomplete")
+                self.assertEqual(popen.call_count, 1)
+                self.assertIn(f"Scan failed during official feed download; {reason}.", report["limitations"])
+                self.assertNotIn("private-host", json.dumps(report))
+                self.assertNotIn("secret-token", json.dumps(report))
+
+    def test_download_diagnostics_do_not_mislabel_other_phases(self):
+        with patch.object(scanner, "_unpack", side_effect=OSError("secret-token")):
+            report, popen, _, _ = self.scan()
         self.assertEqual(report["status"], "incomplete")
+        self.assertEqual(popen.call_count, 1)
+        self.assertIn("Scan failed during official feed validation; system/network diagnostics withheld.",
+                      report["limitations"])
         self.assertNotIn("secret-token", json.dumps(report))
 
     def test_timeout_kills_process_group_and_keeps_incomplete_summary(self):

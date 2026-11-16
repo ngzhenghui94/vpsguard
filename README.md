@@ -101,6 +101,8 @@ Exit codes:
 
 The manual **Verify native distro scans** GitHub Actions workflow is configured to run regression tests, then real native-package scans in disposable Debian 13, Ubuntu 24.04, AlmaLinux 9 and openSUSE Leap 16.0 containers. Fedora 43 and Amazon Linux 2023 containers exercise audit-only behavior. The scan checks require actual DPKG/RPM package-probe evidence, not merely a successful process exit. This is not host/kernel/firewall validation, does not exercise destructive hardening, and is not evidence that every listed release works. No passing workflow or test result is asserted here.
 
+Live validation on 2026-11-16 completed the Ubuntu 24.04 scan and Fedora 43/Amazon Linux 2023 audits, but did **not** establish complete scanning on the other tested distributions. Debian's published feed declared a future generator timestamp and was rejected; its timestamp is not silently reinterpreted. AlmaLinux's download and openSUSE's platform/evaluation checks also failed in that run. These failures are not clean vulnerability results. The workflow retains its complete-evaluation assertions so such failures stay visible.
+
 ## Safety boundaries
 
 - Keep provider-console access and an independent backup before changing a server.

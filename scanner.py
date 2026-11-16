@@ -349,9 +349,24 @@ def run_scan(output_dir):
     except subprocess.TimeoutExpired:
         report["status"] = "incomplete"
         report["limitations"].append(f"Scan timed out during {phase}; engine diagnostics withheld.")
-    except (OSError, EOFError, ValueError, urllib.error.URLError, http.client.HTTPException):
+    except (OSError, EOFError, ValueError, urllib.error.URLError, http.client.HTTPException) as error:
         report["status"] = "incomplete"
-        report["limitations"].append(f"Scan failed during {phase}; system/network diagnostics withheld.")
+        reason = "system/network diagnostics withheld"
+        if phase == "official feed download":
+            cause = error.reason if isinstance(error, urllib.error.URLError) else error
+            if isinstance(error, urllib.error.HTTPError) and isinstance(error.code, int) and 100 <= error.code <= 599:
+                reason = f"HTTP status {error.code}"
+            elif isinstance(cause, ssl.SSLCertVerificationError):
+                reason = "TLS certificate verification failure"
+            elif isinstance(cause, ssl.SSLError):
+                reason = "TLS connection error"
+            elif isinstance(cause, TimeoutError):
+                reason = "network timeout"
+            elif isinstance(error, urllib.error.URLError) or isinstance(cause, ConnectionError):
+                reason = "network connection error"
+            elif isinstance(cause, http.client.HTTPException):
+                reason = "HTTP protocol error"
+        report["limitations"].append(f"Scan failed during {phase}; {reason}.")
     except KeyboardInterrupt:
         report["status"] = "incomplete"
         report["limitations"].append("Scan interrupted; evaluation is incomplete.")

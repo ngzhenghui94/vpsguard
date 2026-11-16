@@ -48,6 +48,12 @@ case "$backend" in
         ;;
 esac
 
+if [[ $backend == zypper ]]; then
+    # Public container release markers diagnose vendor platform-test mismatches.
+    phase='native SUSE release identity'
+    rpm -qa --qf '%{NAME} %{VERSION}\n' | awk '/^(Leap|openSUSE)-release( |-)/'
+fi
+
 phase='read-only audit'
 "$python" vpsguard.py audit >"$scratch/audit.json" 2>"$scratch/audit.stderr"
 phase='audit contract checks'
